@@ -20,10 +20,18 @@ Pantheon is a safe cyber-range project for learning Kubernetes attack paths and 
 
 All attack behavior is simulated as generated logs and path data. The MVP does not attack real hosts, external IPs, domains, or local services.
 
+## Local Project Root
+
+Commands below assume the project is located at:
+
+```text
+D:\Pantheon
+```
+
 ## Run Demo Dashboard
 
 ```powershell
-cd "C:\Users\ASUS\OneDrive\Documents\New project\pantheon"
+cd "D:\Pantheon"
 npm.cmd start
 ```
 
@@ -47,7 +55,7 @@ The FastAPI backend exposes the real API foundation on port `8000`. It uses Post
 Start PostgreSQL and the API with Docker:
 
 ```powershell
-cd "C:\Users\ASUS\OneDrive\Documents\New project\pantheon"
+cd "D:\Pantheon"
 docker compose up --build
 ```
 
