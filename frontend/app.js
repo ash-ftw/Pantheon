@@ -9,12 +9,15 @@ const state = {
   selectedScenarioId: "multi-stage-chain",
   simulation: null,
   report: null,
+  kubernetesStatus: null,
+  kubernetesPolling: false,
   loading: true,
   message: "",
   error: ""
 };
 
 const app = document.querySelector("#app");
+let kubernetesPollTimer = null;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -52,6 +55,36 @@ async function api(path, options = {}) {
 function setMessage(message, isError = false) {
   state.message = isError ? "" : message;
   state.error = isError ? message : "";
+  render();
+}
+
+function stopKubernetesPolling() {
+  if (kubernetesPollTimer) {
+    clearInterval(kubernetesPollTimer);
+    kubernetesPollTimer = null;
+  }
+  state.kubernetesPolling = false;
+}
+
+async function pollKubernetesStatus(labId, silent = false) {
+  const result = await api(`/api/labs/${labId}/kubernetes-status`);
+  state.kubernetesStatus = result.kubernetesStatus;
+  state.labs = state.labs.map((lab) => (lab.id === result.lab.id ? result.lab : lab));
+  if (!silent) state.message = "Kubernetes status refreshed.";
+  state.error = "";
+  render();
+}
+
+function startKubernetesPolling(labId) {
+  stopKubernetesPolling();
+  state.kubernetesPolling = true;
+  pollKubernetesStatus(labId, false).catch((error) => setMessage(error.message, true));
+  kubernetesPollTimer = setInterval(() => {
+    pollKubernetesStatus(labId, true).catch((error) => {
+      stopKubernetesPolling();
+      setMessage(error.message, true);
+    });
+  }, 5000);
   render();
 }
 
@@ -200,6 +233,7 @@ function renderDashboard() {
           ${state.message ? `<div class="success">${escapeHtml(state.message)}</div>` : ""}
           ${renderMetrics()}
           ${lab ? renderLabDetail(lab, simulation) : renderNoLab()}
+          ${lab ? renderKubernetesStatus(lab) : ""}
           ${lab ? renderTargetApps(lab) : ""}
           ${lab ? renderScenarios(lab) : ""}
           ${simulation ? renderSimulation(simulation) : ""}
@@ -359,6 +393,59 @@ function renderSafetyStrip(lab) {
       <div class="indicator info"><span class="dot"></span><strong>${lab.services.length}</strong><small>lab services</small></div>
       <div class="indicator info"><span class="dot"></span><strong>${lab.targetApplications?.length || 0}</strong><small>imported apps</small></div>
     </div>
+  `;
+}
+
+function renderKubernetesStatus(lab) {
+  const status = state.kubernetesStatus?.labId === lab.id ? state.kubernetesStatus : null;
+  const summary = status?.summary;
+  const services = status?.services || [];
+  const jobs = status?.jobs || [];
+  return `
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h2>Live Kubernetes Status</h2>
+          <p>${status ? `Last observed ${escapeHtml(new Date(status.observedAt).toLocaleTimeString())}` : "Poll the lab namespace for live service and job readiness."}</p>
+        </div>
+        <div class="button-row">
+          <button class="btn ghost" data-action="poll-kubernetes" data-lab-id="${escapeHtml(lab.id)}">Refresh status</button>
+          <button class="btn ${state.kubernetesPolling ? "danger" : "primary"}" data-action="toggle-kubernetes-poll" data-lab-id="${escapeHtml(lab.id)}">
+            ${state.kubernetesPolling ? "Stop live poll" : "Start live poll"}
+          </button>
+        </div>
+      </div>
+      ${
+        status
+          ? `<div class="indicator-track k8s-track">
+              <div class="indicator ${summary.allReady ? "good" : "info"}"><span class="dot"></span><strong>${summary.readyServices}/${summary.totalServices}</strong><small>ready services</small></div>
+              <div class="indicator info"><span class="dot"></span><strong>${summary.pendingServices}</strong><small>pending services</small></div>
+              <div class="indicator ${summary.failedServices ? "bad" : "good"}"><span class="dot"></span><strong>${summary.failedServices}</strong><small>failed services</small></div>
+              <div class="indicator info"><span class="dot"></span><strong>${jobs.length}</strong><small>runner jobs</small></div>
+            </div>
+            <div class="table-wrap compact-table">
+              <table>
+                <thead><tr><th>Service</th><th>Status</th><th>Ready</th><th>Pods</th></tr></thead>
+                <tbody>
+                  ${services
+                    .map(
+                      (service) => `
+                        <tr>
+                          <td>${escapeHtml(service.name)}<div class="muted tiny">${escapeHtml(service.type)}</div></td>
+                          <td>${statusBadge(service.status)}</td>
+                          <td>${escapeHtml(service.readyReplicas ?? 0)} / ${escapeHtml(service.replicas ?? 0)}</td>
+                          <td>${(service.pods || []).map((pod) => `<span class="badge ${pod.phase === "Running" ? "green" : "amber"}">${escapeHtml(pod.name)} ${escapeHtml(pod.phase)}</span>`).join(" ") || `<span class="badge amber">no pods</span>`}</td>
+                        </tr>
+                      `
+                    )
+                    .join("")}
+                </tbody>
+              </table>
+            </div>
+            ${jobs.length ? `<div class="badge-row k8s-jobs">${jobs.map((job) => `<span class="badge cyan">${escapeHtml(job.name)} ${escapeHtml(job.phase)}</span>`).join("")}</div>` : ""}`
+          : `<div class="empty">No Kubernetes status has been polled for this lab yet.</div>`
+      }
+    </section>
   `;
 }
 
@@ -560,6 +647,10 @@ function renderScenarios(lab) {
 
 
 function renderSimulation(simulation) {
+  const observedLogs = (simulation.logs || []).filter((log) => {
+    const raw = log.rawLogJson || {};
+    return raw.observed_source || raw.observedSource;
+  });
   return `
     <section class="panel">
       <div class="panel-header">
@@ -569,6 +660,7 @@ function renderSimulation(simulation) {
         </div>
         <div class="button-row">
           ${riskBadge(simulation.riskLevel)}
+          <span class="badge ${observedLogs.length ? "green" : "blue"}">${observedLogs.length} observed k8s logs</span>
           <button class="btn ghost" data-action="rerun-simulation" data-scenario-id="${escapeHtml(simulation.scenarioId)}">Rerun</button>
           <button class="btn primary" data-action="create-report" data-simulation-id="${escapeHtml(simulation.id)}">Generate report</button>
         </div>
@@ -910,8 +1002,10 @@ app.addEventListener("click", async (event) => {
       state.token = "";
       state.user = null;
       state.labs = [];
+      stopKubernetesPolling();
       state.simulation = null;
       state.report = null;
+      state.kubernetesStatus = null;
       render();
     }
     if (action === "refresh") {
@@ -922,20 +1016,25 @@ app.addEventListener("click", async (event) => {
     if (action === "select-lab") {
       state.selectedLabId = target.dataset.labId;
       localStorage.setItem("pantheon_selected_lab", state.selectedLabId);
+      stopKubernetesPolling();
       state.simulation = null;
       state.report = null;
+      state.kubernetesStatus = null;
       render();
     }
     if (action === "start-lab" || action === "stop-lab") {
       const verb = action === "start-lab" ? "start" : "stop";
       await api(`/api/labs/${target.dataset.labId}/${verb}`, { method: "POST", body: "{}" });
       await loadDashboard();
+      state.kubernetesStatus = null;
       state.message = `Lab ${verb === "start" ? "started" : "stopped"}.`;
       render();
     }
     if (action === "delete-lab") {
       await api(`/api/labs/${target.dataset.labId}`, { method: "DELETE" });
       await loadDashboard();
+      stopKubernetesPolling();
+      state.kubernetesStatus = null;
       state.message = "Lab deleted.";
       state.simulation = null;
       state.report = null;
@@ -944,6 +1043,18 @@ app.addEventListener("click", async (event) => {
     if (action === "select-scenario") {
       state.selectedScenarioId = target.dataset.scenarioId;
       render();
+    }
+    if (action === "poll-kubernetes") {
+      await pollKubernetesStatus(target.dataset.labId);
+    }
+    if (action === "toggle-kubernetes-poll") {
+      if (state.kubernetesPolling) {
+        stopKubernetesPolling();
+        state.message = "Kubernetes live polling stopped.";
+        render();
+      } else {
+        startKubernetesPolling(target.dataset.labId);
+      }
     }
     if (action === "run-simulation") {
       const lab = selectedLab();

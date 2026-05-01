@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import os
 import sys
 import tempfile
@@ -15,6 +16,7 @@ os.environ["PANTHEON_AUTO_CREATE_TABLES"] = "true"
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
+from app.services.simulation_service import _coerce_job_log_record  # noqa: E402
 
 
 def auth_headers(client: TestClient) -> dict[str, str]:
@@ -34,6 +36,48 @@ def create_lab(client: TestClient, headers: dict[str, str]) -> dict:
     )
     assert response.status_code == 201, response.text
     return response.json()["lab"]
+
+
+def test_kubernetes_status_endpoint_returns_dry_run_readiness() -> None:
+    with TestClient(app) as client:
+        headers = auth_headers(client)
+        lab = create_lab(client, headers)
+
+        response = client.get(f"/api/labs/{lab['id']}/kubernetes-status", headers=headers)
+
+        assert response.status_code == 200, response.text
+        payload = response.json()["kubernetesStatus"]
+        assert payload["labId"] == lab["id"]
+        assert payload["namespace"]["phase"] == "DryRun"
+        assert payload["summary"]["allReady"] is True
+        assert payload["summary"]["readyServices"] == payload["summary"]["totalServices"]
+        assert payload["services"]
+        assert all(service["status"] == "Running" for service in payload["services"])
+
+
+def test_observed_kubernetes_log_record_is_normalized() -> None:
+    record = {
+        "timestamp": "2026-05-01T10:00:00Z",
+        "source_service": "kubernetes",
+        "target_service": "pantheon-attack-abc123",
+        "method": "OBSERVE",
+        "endpoint": "k8s/jobs/pantheon-attack-abc123",
+        "status_code": 0,
+        "request_count": 1,
+        "payload_category": "kubernetes_observation",
+        "event_type": "kubernetes_job_running",
+        "severity": "Info",
+        "is_attack_simulation": False,
+        "raw_log_json": {"observed_source": "kubernetes_api", "job_name": "pantheon-attack-abc123"},
+    }
+
+    normalized = _coerce_job_log_record(record, datetime.now(timezone.utc))
+
+    assert normalized["event_type"] == "kubernetes_job_running"
+    assert normalized["method"] == "OBSERVE"
+    assert normalized["raw_log_json"]["observed_source"] == "kubernetes_api"
+    assert normalized["is_attack_simulation"] is False
+    assert normalized["timestamp"].tzinfo is not None
 
 
 def test_byo_target_custom_scenario_simulation_and_report() -> None:

@@ -88,6 +88,32 @@ def get_lab(lab_id: str, db: Session = Depends(get_db), user: User = Depends(get
     return {"lab": lab_to_api(lab)}
 
 
+@router.get("/{lab_id}/kubernetes-status")
+def get_kubernetes_status(
+    lab_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    lab = _load_lab(db, lab_id)
+    if not lab or not can_access_lab(user, lab.user_id):
+        raise HTTPException(status_code=404, detail="Lab not found")
+    try:
+        status_payload = KubernetesService().get_lab_status(lab.namespace, _service_definitions_for_lab(lab))
+        status_payload["labId"] = lab.id
+        _apply_kubernetes_status(lab, status_payload)
+        lab.error_message = None
+    except KubernetesProvisioningError as exc:
+        lab.status = "Failed"
+        lab.error_message = str(exc)
+        db.commit()
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    db.commit()
+    loaded = _load_lab(db, lab.id)
+    if not loaded:
+        raise HTTPException(status_code=500, detail="Lab status was refreshed but could not be loaded")
+    return {"kubernetesStatus": status_payload, "lab": lab_to_api(loaded)}
+
+
 @router.delete("/{lab_id}", response_model=dict[str, LabOut])
 def delete_lab(lab_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> dict:
     lab = _load_lab(db, lab_id)
@@ -199,3 +225,24 @@ def _ensure_service_instances(db: Session, lab: Lab, service_definitions: list[d
                 exposed=bool(service.get("exposed")),
             )
         )
+
+
+def _apply_kubernetes_status(lab: Lab, status_payload: dict) -> None:
+    by_name = {item["name"]: item for item in status_payload.get("services", [])}
+    for service in lab.services:
+        service_status = by_name.get(service.service_name)
+        if service_status:
+            service.status = service_status.get("status", service.status)
+    for target in lab.target_applications:
+        service_status = by_name.get(target.service_name)
+        if service_status:
+            target.status = service_status.get("status", target.status)
+    summary = status_payload.get("summary", {})
+    if summary.get("failedServices", 0) > 0:
+        lab.status = "Failed"
+        return
+    if summary.get("allReady"):
+        lab.status = "Running"
+        return
+    if lab.status not in {"Stopped", "Deleted"}:
+        lab.status = "Provisioning"

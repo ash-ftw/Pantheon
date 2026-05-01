@@ -148,6 +148,13 @@ def run_simulation(db: Session, lab: Lab, scenario: AttackScenario) -> Simulatio
             for item in generated_logs
             if item["is_attack_simulation"] and item["event_type"] != "simulation_job_completed"
         ]
+        if not attack_logs:
+            attack_logs = [
+                item
+                for item in generated_logs
+                if item.get("raw_log_json", {}).get("observed_source") == "kubernetes_job_log"
+                and item["target_service"] not in {"attack-runner", "traffic-generator"}
+            ]
         suspicious_event_count = len(attack_logs)
         blocked_log = next((item for item in attack_logs if item["event_type"] == "blocked_by_defense"), None)
         blocked = blocked_log is not None
@@ -378,7 +385,7 @@ def _coerce_job_log_record(record: dict[str, Any], fallback_time: datetime) -> d
         "event_type": str(record.get("event_type", "runner_event")),
         "severity": str(record.get("severity", "Info")),
         "is_attack_simulation": bool(record.get("is_attack_simulation", False)),
-        "raw_log_json": raw_log if isinstance(raw_log, dict) else {},
+        "raw_log_json": raw_log if isinstance(raw_log, dict) else {"raw_log": str(raw_log)},
     }
 
 

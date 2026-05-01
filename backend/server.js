@@ -826,6 +826,44 @@ function labResponse(lab) {
   };
 }
 
+function mockKubernetesStatus(lab) {
+  const services = (lab.services || []).map((service) => ({
+    name: service.serviceName,
+    type: service.serviceType,
+    status: service.status === "Deleted" ? "Missing" : service.status || "Running",
+    replicas: service.status === "Stopped" ? 0 : 1,
+    readyReplicas: service.status === "Stopped" ? 0 : 1,
+    availableReplicas: service.status === "Stopped" ? 0 : 1,
+    pods: [
+      {
+        name: `${service.serviceName}-mock`,
+        phase: service.status === "Stopped" ? "Succeeded" : "Running",
+        readyContainers: service.status === "Stopped" ? 0 : 1,
+        totalContainers: 1,
+        restartCount: 0
+      }
+    ],
+    conditions: []
+  }));
+  const ready = services.filter((service) => service.status === "Running").length;
+  const failed = services.filter((service) => service.status === "Failed" || service.status === "Missing").length;
+  return {
+    labId: lab.id,
+    mode: "mock",
+    namespace: { name: lab.namespace, phase: "Mock" },
+    summary: {
+      totalServices: services.length,
+      readyServices: ready,
+      pendingServices: Math.max(0, services.length - ready - failed),
+      failedServices: failed,
+      allReady: services.length > 0 && ready === services.length
+    },
+    services,
+    jobs: [],
+    observedAt: nowIso()
+  };
+}
+
 function contentTypeFor(filePath) {
   const ext = path.extname(filePath).toLowerCase();
   const types = {
@@ -1127,6 +1165,16 @@ async function handleApi(req, res, pathname) {
       store.customScenarios.push(scenario);
       saveStore();
       send(res, 201, { scenario });
+      return;
+    }
+
+    const labKubernetesStatusMatch = pathname.match(/^\/api\/labs\/([^/]+)\/kubernetes-status$/);
+    if (req.method === "GET" && labKubernetesStatusMatch) {
+      const lab = store.labs.find((item) => item.id === labKubernetesStatusMatch[1]);
+      if (!lab || !canAccessLab(user, lab)) return sendError(res, 404, "Lab not found");
+      const status = mockKubernetesStatus(lab);
+      saveStore();
+      send(res, 200, { kubernetesStatus: status, lab: labResponse(lab) });
       return;
     }
 

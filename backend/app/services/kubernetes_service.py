@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -123,6 +124,41 @@ class KubernetesService:
         self._networking = client.NetworkingV1Api()
         self._batch = client.BatchV1Api()
 
+    def get_lab_status(self, namespace: str, services: list[dict[str, Any]]) -> dict[str, Any]:
+        self._validate_namespace(namespace)
+        self._validate_services(services)
+        if self.is_dry_run:
+            return self._dry_run_status(namespace, services)
+
+        self._connect()
+        try:
+            namespace_obj = self._core.read_namespace(namespace)
+            service_statuses = [self._deployment_service_status(namespace, service) for service in services]
+            jobs = self._list_runner_jobs(namespace)
+        except Exception as exc:  # pragma: no cover - depends on cluster client
+            raise KubernetesProvisioningError(f"Unable to inspect Kubernetes status for {namespace}: {exc}") from exc
+
+        failed = sum(1 for item in service_statuses if item["status"] in {"Failed", "Missing"})
+        ready = sum(1 for item in service_statuses if item["status"] == "Running")
+        pending = sum(1 for item in service_statuses if item["status"] == "Pending")
+        return {
+            "mode": self.mode,
+            "namespace": {
+                "name": namespace,
+                "phase": getattr(namespace_obj.status, "phase", "Unknown"),
+            },
+            "summary": {
+                "totalServices": len(service_statuses),
+                "readyServices": ready,
+                "pendingServices": pending,
+                "failedServices": failed,
+                "allReady": bool(service_statuses) and ready == len(service_statuses),
+            },
+            "services": service_statuses,
+            "jobs": jobs,
+            "observedAt": self._now_iso(),
+        }
+
     def run_simulation_jobs(
         self,
         namespace: str,
@@ -143,31 +179,32 @@ class KubernetesService:
         attack_job = f"pantheon-attack-{run_id}"
         results: list[dict[str, Any]] = []
         try:
-            self._create_runner_job(
-                namespace=namespace,
-                job_name=traffic_job,
-                command=["python", "traffic_generator.py"],
-                env={
-                    "SIMULATION_ID_JSON": json.dumps(simulation_id),
-                    "SERVICES_JSON": json.dumps(services),
-                    "NORMAL_TRAFFIC_JSON": json.dumps(normal_traffic),
-                },
+            results.extend(
+                self._run_observed_job(
+                    namespace=namespace,
+                    simulation_id=simulation_id,
+                    job_name=traffic_job,
+                    command=["python", "traffic_generator.py"],
+                    env={
+                        "SIMULATION_ID_JSON": json.dumps(simulation_id),
+                        "SERVICES_JSON": json.dumps(services),
+                        "NORMAL_TRAFFIC_JSON": json.dumps(normal_traffic),
+                    },
+                )
             )
-            self._wait_for_job(namespace, traffic_job)
-            results.extend(self._read_job_json_logs(namespace, traffic_job))
-
-            self._create_runner_job(
-                namespace=namespace,
-                job_name=attack_job,
-                command=["python", "runner.py"],
-                env={
-                    "SIMULATION_ID_JSON": json.dumps(simulation_id),
-                    "SERVICES_JSON": json.dumps(services),
-                    "SCENARIO_CONFIG_JSON": json.dumps(scenario_config),
-                },
+            results.extend(
+                self._run_observed_job(
+                    namespace=namespace,
+                    simulation_id=simulation_id,
+                    job_name=attack_job,
+                    command=["python", "runner.py"],
+                    env={
+                        "SIMULATION_ID_JSON": json.dumps(simulation_id),
+                        "SERVICES_JSON": json.dumps(services),
+                        "SCENARIO_CONFIG_JSON": json.dumps(scenario_config),
+                    },
+                )
             )
-            self._wait_for_job(namespace, attack_job)
-            results.extend(self._read_job_json_logs(namespace, attack_job))
         finally:
             self._delete_job(namespace, traffic_job)
             self._delete_job(namespace, attack_job)
@@ -197,6 +234,43 @@ class KubernetesService:
             results.append(ResourceResult("Deployment", service["name"], "Created", "Dry-run deployment recorded."))
             results.append(ResourceResult("Service", service["name"], "Created", "Dry-run service recorded."))
         return results
+
+    def _dry_run_status(self, namespace: str, services: list[dict[str, Any]]) -> dict[str, Any]:
+        service_statuses = [
+            {
+                "name": service["name"],
+                "type": service.get("type", "service"),
+                "status": "Running",
+                "replicas": 1,
+                "readyReplicas": 1,
+                "availableReplicas": 1,
+                "pods": [
+                    {
+                        "name": f"{service['name']}-dry-run",
+                        "phase": "Running",
+                        "readyContainers": 1,
+                        "totalContainers": 1,
+                        "restartCount": 0,
+                    }
+                ],
+                "conditions": [],
+            }
+            for service in services
+        ]
+        return {
+            "mode": self.mode,
+            "namespace": {"name": namespace, "phase": "DryRun"},
+            "summary": {
+                "totalServices": len(service_statuses),
+                "readyServices": len(service_statuses),
+                "pendingServices": 0,
+                "failedServices": 0,
+                "allReady": bool(service_statuses),
+            },
+            "services": service_statuses,
+            "jobs": [],
+            "observedAt": self._now_iso(),
+        }
 
     def _create_namespace(self, namespace: str) -> ResourceResult:
         from kubernetes import client
@@ -537,34 +611,300 @@ class KubernetesService:
         except ApiException as exc:
             raise KubernetesProvisioningError(f"Unable to create job {job_name}: {exc}") from exc
 
-    def _wait_for_job(self, namespace: str, job_name: str) -> None:
+    def _run_observed_job(
+        self,
+        *,
+        namespace: str,
+        simulation_id: str,
+        job_name: str,
+        command: list[str],
+        env: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        records = [
+            self._observed_log_record(
+                simulation_id=simulation_id,
+                job_name=job_name,
+                event_type="kubernetes_job_starting",
+                raw={"command": command, "env_keys": sorted(env)},
+            )
+        ]
+        self._create_runner_job(namespace=namespace, job_name=job_name, command=command, env=env)
+        records.append(
+            self._observed_log_record(
+                simulation_id=simulation_id,
+                job_name=job_name,
+                event_type="kubernetes_job_created",
+                raw={"namespace": namespace},
+            )
+        )
+        records.extend(self._wait_for_job(namespace, job_name, simulation_id))
+        records.extend(self._read_job_observed_logs(namespace, job_name, simulation_id))
+        return records
+
+    def _wait_for_job(self, namespace: str, job_name: str, simulation_id: str) -> list[dict[str, Any]]:
         deadline = time.time() + self.settings.job_timeout_seconds
+        last_phase: str | None = None
+        records: list[dict[str, Any]] = []
         while time.time() < deadline:
             job = self._batch.read_namespaced_job(job_name, namespace)
+            phase = self._job_phase(job)
+            if phase != last_phase:
+                records.append(
+                    self._observed_log_record(
+                        simulation_id=simulation_id,
+                        job_name=job_name,
+                        event_type=f"kubernetes_job_{phase.lower()}",
+                        severity="Warning" if phase in {"Failed", "Pending"} else "Info",
+                        raw=self._job_snapshot(job),
+                    )
+                )
+                last_phase = phase
             status = job.status
             if status.succeeded and status.succeeded >= 1:
-                return
+                records.append(
+                    self._observed_log_record(
+                        simulation_id=simulation_id,
+                        job_name=job_name,
+                        event_type="kubernetes_job_succeeded",
+                        raw=self._job_snapshot(job),
+                    )
+                )
+                return records
             if status.failed and status.failed >= 1:
+                records.append(
+                    self._observed_log_record(
+                        simulation_id=simulation_id,
+                        job_name=job_name,
+                        event_type="kubernetes_job_failed",
+                        severity="Critical",
+                        raw=self._job_snapshot(job),
+                    )
+                )
                 raise KubernetesProvisioningError(f"Simulation job failed: {job_name}")
             time.sleep(1)
+        records.append(
+            self._observed_log_record(
+                simulation_id=simulation_id,
+                job_name=job_name,
+                event_type="kubernetes_job_timeout",
+                severity="Critical",
+                raw={"timeout_seconds": self.settings.job_timeout_seconds},
+            )
+        )
         raise KubernetesProvisioningError(f"Simulation job timed out: {job_name}")
 
-    def _read_job_json_logs(self, namespace: str, job_name: str) -> list[dict[str, Any]]:
+    def _read_job_observed_logs(self, namespace: str, job_name: str, simulation_id: str) -> list[dict[str, Any]]:
         pods = self._core.list_namespaced_pod(
             namespace,
             label_selector=f"job-name={job_name}",
         ).items
         records: list[dict[str, Any]] = []
         for pod in pods:
-            logs = self._core.read_namespaced_pod_log(pod.metadata.name, namespace)
+            pod_name = pod.metadata.name
+            records.append(
+                self._observed_log_record(
+                    simulation_id=simulation_id,
+                    job_name=job_name,
+                    event_type="kubernetes_pod_observed",
+                    raw={"pod": self._pod_snapshot(pod)},
+                    target=pod_name,
+                )
+            )
+            try:
+                logs = self._core.read_namespaced_pod_log(pod_name, namespace)
+            except Exception as exc:  # pragma: no cover - depends on cluster client
+                records.append(
+                    self._observed_log_record(
+                        simulation_id=simulation_id,
+                        job_name=job_name,
+                        event_type="kubernetes_pod_log_unavailable",
+                        severity="Warning",
+                        raw={"pod_name": pod_name, "error": str(exc)},
+                        target=pod_name,
+                    )
+                )
+                continue
             for line in logs.splitlines():
+                if not line.strip():
+                    continue
                 try:
                     record = json.loads(line)
                 except json.JSONDecodeError:
+                    records.append(
+                        self._observed_log_record(
+                            simulation_id=simulation_id,
+                            job_name=job_name,
+                            event_type="container_log_line",
+                            raw={"pod_name": pod_name, "line": line},
+                            target=pod_name,
+                        )
+                    )
                     continue
                 if self._is_runner_log_record(record):
+                    raw_log = record.get("raw_log_json") if isinstance(record.get("raw_log_json"), dict) else {}
+                    record["raw_log_json"] = {
+                        **raw_log,
+                        "observed_source": "kubernetes_job_log",
+                        "job_name": job_name,
+                        "pod_name": pod_name,
+                    }
                     records.append(record)
+                else:
+                    records.append(
+                        self._observed_log_record(
+                            simulation_id=simulation_id,
+                            job_name=job_name,
+                            event_type="container_json_log_line",
+                            raw={"pod_name": pod_name, "record": record},
+                            target=pod_name,
+                        )
+                    )
         return records
+
+    def _deployment_service_status(self, namespace: str, service: dict[str, Any]) -> dict[str, Any]:
+        from kubernetes.client import ApiException
+
+        service_name = service["name"]
+        try:
+            deployment = self._apps.read_namespaced_deployment(service_name, namespace)
+        except ApiException as exc:
+            if exc.status == 404:
+                return {
+                    "name": service_name,
+                    "type": service.get("type", "service"),
+                    "status": "Missing",
+                    "replicas": 0,
+                    "readyReplicas": 0,
+                    "availableReplicas": 0,
+                    "pods": [],
+                    "conditions": [],
+                    "message": "Deployment was not found in the lab namespace.",
+                }
+            raise
+        status = deployment.status
+        replicas = int(status.replicas or 0)
+        ready = int(status.ready_replicas or 0)
+        available = int(status.available_replicas or 0)
+        conditions = self._conditions_snapshot(status.conditions or [])
+        failed = any(item["type"] == "ReplicaFailure" and item["status"] == "True" for item in conditions)
+        if failed:
+            phase = "Failed"
+        elif replicas == 0:
+            phase = "Stopped"
+        elif replicas > 0 and ready >= replicas and available >= 1:
+            phase = "Running"
+        else:
+            phase = "Pending"
+        pods = self._pods_for_selector(namespace, f"pantheon.io/service={service_name}")
+        return {
+            "name": service_name,
+            "type": service.get("type", "service"),
+            "status": phase,
+            "replicas": replicas,
+            "readyReplicas": ready,
+            "availableReplicas": available,
+            "pods": [self._pod_snapshot(pod) for pod in pods],
+            "conditions": conditions,
+        }
+
+    def _pods_for_selector(self, namespace: str, selector: str) -> list[Any]:
+        try:
+            return self._core.list_namespaced_pod(namespace, label_selector=selector).items
+        except Exception:  # pragma: no cover - depends on cluster client
+            return []
+
+    def _list_runner_jobs(self, namespace: str) -> list[dict[str, Any]]:
+        try:
+            jobs = self._batch.list_namespaced_job(
+                namespace,
+                label_selector="pantheon.io/job-type=simulation-runner",
+            ).items
+        except Exception:  # pragma: no cover - depends on cluster client
+            return []
+        return [self._job_snapshot(job) for job in jobs]
+
+    def _job_phase(self, job: Any) -> str:
+        status = job.status
+        if status.failed and status.failed >= 1:
+            return "Failed"
+        if status.succeeded and status.succeeded >= 1:
+            return "Succeeded"
+        if status.active and status.active >= 1:
+            return "Running"
+        return "Pending"
+
+    def _job_snapshot(self, job: Any) -> dict[str, Any]:
+        status = job.status
+        return {
+            "name": job.metadata.name,
+            "phase": self._job_phase(job),
+            "active": int(status.active or 0),
+            "succeeded": int(status.succeeded or 0),
+            "failed": int(status.failed or 0),
+            "startTime": status.start_time.isoformat() if status.start_time else None,
+            "completionTime": status.completion_time.isoformat() if status.completion_time else None,
+            "conditions": self._conditions_snapshot(status.conditions or []),
+        }
+
+    def _pod_snapshot(self, pod: Any) -> dict[str, Any]:
+        container_statuses = pod.status.container_statuses or []
+        ready = sum(1 for item in container_statuses if item.ready)
+        restarts = sum(int(item.restart_count or 0) for item in container_statuses)
+        return {
+            "name": pod.metadata.name,
+            "phase": pod.status.phase,
+            "readyContainers": ready,
+            "totalContainers": len(container_statuses),
+            "restartCount": restarts,
+            "nodeName": pod.spec.node_name,
+            "reason": pod.status.reason,
+            "message": pod.status.message,
+        }
+
+    def _conditions_snapshot(self, conditions: list[Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": condition.type,
+                "status": condition.status,
+                "reason": condition.reason,
+                "message": condition.message,
+            }
+            for condition in conditions
+        ]
+
+    def _observed_log_record(
+        self,
+        *,
+        simulation_id: str,
+        job_name: str,
+        event_type: str,
+        raw: dict[str, Any],
+        severity: str = "Info",
+        source: str = "kubernetes",
+        target: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "timestamp": self._now_iso(),
+            "source_service": source,
+            "target_service": target or job_name,
+            "method": "OBSERVE",
+            "endpoint": f"k8s/jobs/{job_name}",
+            "status_code": 0,
+            "request_count": 1,
+            "payload_category": "kubernetes_observation",
+            "event_type": event_type,
+            "severity": severity,
+            "is_attack_simulation": False,
+            "raw_log_json": {
+                "observed_source": "kubernetes_api",
+                "simulation_id": simulation_id,
+                "job_name": job_name,
+                **raw,
+            },
+        }
+
+    def _now_iso(self) -> str:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     def _delete_job(self, namespace: str, job_name: str) -> None:
         from kubernetes.client import ApiException

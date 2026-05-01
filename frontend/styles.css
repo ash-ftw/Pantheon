@@ -494,6 +494,10 @@ button {
   background: var(--cyan);
 }
 
+.indicator.bad .dot {
+  background: var(--red);
+}
+
 .subpanel {
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -666,6 +670,18 @@ textarea:focus {
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: var(--radius);
+}
+
+.compact-table {
+  margin-top: 10px;
+}
+
+.k8s-track {
+  margin-bottom: 10px;
+}
+
+.k8s-jobs {
+  margin-top: 10px;
 }
 
 table {

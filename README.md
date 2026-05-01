@@ -17,8 +17,10 @@ Pantheon is a safe cyber-range project for learning Kubernetes attack paths and 
 - Defense recommendation and application
 - Rerun workflow with before/after comparison
 - Dashboard report generation
+- Live Kubernetes pod/job status polling for lab services
+- Observed Kubernetes job/pod lifecycle logs in real mode
 
-All attack behavior is simulated as generated logs and path data. The MVP does not attack real hosts, external IPs, domains, or local services.
+Attack behavior is constrained to preset or custom safe scenarios inside the selected lab. In dry-run mode, Pantheon still uses generated logs and path data. In real Kubernetes mode, traffic and attack runners execute as Kubernetes Jobs and Pantheon records observed job, pod, and container-log events. The MVP does not attack real hosts, external IPs, domains, or local services outside the lab namespace.
 
 ## Local Project Root
 
@@ -128,7 +130,7 @@ docker compose run --rm --no-deps `
   api pytest -q
 ```
 
-Current tests cover the BYO web-app target workflow, custom scenario execution, report target inclusion, external target rejection, and duplicate service-name rejection.
+Current tests cover the BYO web-app target workflow, custom scenario execution, report target inclusion, external target rejection, duplicate service-name rejection, dry-run Kubernetes readiness polling, and observed Kubernetes log normalization.
 
 ## Bring Your Own Web App Targets
 
@@ -184,8 +186,8 @@ pantheon/
 
 ## Next Engineering Step
 
-The production backend path now covers the full demo workflow: auth, templates, scenarios, labs, simulations, logs, AI analysis, defenses, comparisons, reports, dashboard serving, fake service containers, Kubernetes Job-based traffic/attack runners, Alembic migration scaffolding, and initial API tests. The next implementation steps are:
+The production backend path now covers the full demo workflow: auth, templates, scenarios, labs, simulations, logs, AI analysis, defenses, comparisons, reports, dashboard serving, fake service containers, Kubernetes Job-based traffic/attack runners, live pod/job status polling, observed Kubernetes lifecycle logs, Alembic migration scaffolding, and initial API tests. The next implementation steps are:
 
 - add CI image builds and Kind integration tests
-- add live Kubernetes pod/job status polling
-- replace more generated logs with observed pod and service logs
+- stream simulation progress over WebSockets or server-sent events
+- add deeper service access logs from fake-service containers
