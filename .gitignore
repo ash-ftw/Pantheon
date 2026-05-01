@@ -1,0 +1,8 @@
+backend/data/store.json
+node_modules/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+Thumbs.db
+*.log

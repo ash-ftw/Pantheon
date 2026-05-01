@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: pantheon
+      POSTGRES_USER: pantheon
+      POSTGRES_PASSWORD: pantheon
+    ports:
+      - "5432:5432"
+    volumes:
+      - pantheon_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pantheon -d pantheon"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://pantheon:pantheon@postgres:5432/pantheon
+      SECRET_KEY: change-this-dev-secret
+      KUBERNETES_MODE: dry-run
+      KUBERNETES_NAMESPACE_PREFIX: pantheon-lab
+      KUBERNETES_SERVICE_IMAGE: pantheon-fake-service:latest
+      KUBERNETES_RUNNER_IMAGE: pantheon-runner:latest
+      KUBERNETES_RUNNER_IMAGE_PULL_POLICY: IfNotPresent
+      KUBERNETES_FRONTEND_ORIGINS: http://localhost:8090,http://localhost:5173,http://localhost:3000
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  fake-service-image:
+    profiles: ["images"]
+    image: pantheon-fake-service:latest
+    build:
+      context: ./fake-services/demo-service
+
+  runner-image:
+    profiles: ["images"]
+    image: pantheon-runner:latest
+    build:
+      context: ./attack-engine
+
+volumes:
+  pantheon_postgres:

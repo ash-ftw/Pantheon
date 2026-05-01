@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pantheon-attack-placeholder
+  namespace: pantheon-lab-placeholder
+  labels:
+    app.kubernetes.io/name: pantheon
+    pantheon.io/job-type: simulation-runner
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 120
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pantheon
+        pantheon.io/job-type: simulation-runner
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: runner
+          image: pantheon-runner:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python", "runner.py"]
+          env:
+            - name: SIMULATION_ID_JSON
+              value: "\"placeholder\""
+            - name: SERVICES_JSON
+              value: "[]"
+            - name: SCENARIO_CONFIG_JSON
+              value: "{}"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL

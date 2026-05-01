@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service
+  namespace: pantheon-lab-placeholder
+  labels:
+    app.kubernetes.io/name: pantheon
+    pantheon.io/service: auth-service
+    pantheon.io/service-type: api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      pantheon.io/service: auth-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pantheon
+        pantheon.io/service: auth-service
+        pantheon.io/service-type: api
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: auth-service
+          image: pantheon-fake-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: SERVICE_NAME
+              value: auth-service
+            - name: SERVICE_TYPE
+              value: api
+            - name: PORT
+              value: "8080"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL

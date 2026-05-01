@@ -1,0 +1,45 @@
+{
+  "scenario_id": "multi-stage-chain",
+  "name": "SQL Injection to Lateral Movement",
+  "difficulty": "Advanced",
+  "allowed_templates": ["small-company", "university"],
+  "target_services": ["employee-api", "admin-api", "postgres-db"],
+  "steps": [
+    {
+      "step_order": 1,
+      "action_type": "HTTP_REQUEST_PATTERN",
+      "source": "attack-pod",
+      "target": "employee-api",
+      "endpoint": "/search",
+      "expected_signal": "suspicious_input_pattern"
+    },
+    {
+      "step_order": 2,
+      "action_type": "SIMULATED_CREDENTIAL_DISCOVERY",
+      "source": "employee-api",
+      "target": "admin-api",
+      "expected_signal": "credential_artifact_generated"
+    },
+    {
+      "step_order": 3,
+      "action_type": "UNAUTHORIZED_ACCESS_ATTEMPT",
+      "source": "attack-pod",
+      "target": "admin-api",
+      "endpoint": "/admin/users",
+      "expected_signal": "restricted_endpoint_access"
+    },
+    {
+      "step_order": 4,
+      "action_type": "DATABASE_ACCESS_ATTEMPT",
+      "source": "admin-api",
+      "target": "postgres-db",
+      "expected_signal": "database_reachability_attempt"
+    }
+  ],
+  "recommended_defenses": [
+    "Input validation",
+    "Parameterized queries",
+    "Kubernetes NetworkPolicy",
+    "RBAC hardening"
+  ]
+}
