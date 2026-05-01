@@ -17,7 +17,8 @@ from app.seed import seed_database
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
+    if settings.auto_create_tables:
+        init_db()
     with SessionLocal() as db:
         seed_database(db)
     yield

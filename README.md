@@ -100,6 +100,36 @@ minikube image load pantheon-runner:latest
 ```
 
 
+
+## Database Migrations
+
+The FastAPI backend now includes Alembic migration files for the current schema. The app still defaults to auto-creating tables for local demo convenience. For migration-driven startup, disable auto-create and run Alembic first:
+
+```powershell
+cd "D:\Pantheon"
+docker compose run --rm --no-deps `
+  -e DATABASE_URL="sqlite+pysqlite:////tmp/pantheon-migration-check.db" `
+  -e PANTHEON_AUTO_CREATE_TABLES=false `
+  api alembic -c alembic.ini upgrade head
+```
+
+For PostgreSQL, use the same command with `DATABASE_URL` pointing at your Pantheon PostgreSQL database.
+
+## Backend Tests
+
+Run the API regression tests in the Docker image:
+
+```powershell
+cd "D:\Pantheon"
+docker compose build api
+docker compose run --rm --no-deps `
+  -e KUBERNETES_MODE=dry-run `
+  -e PANTHEON_AUTO_CREATE_TABLES=true `
+  api pytest -q
+```
+
+Current tests cover the BYO web-app target workflow, custom scenario execution, report target inclusion, external target rejection, and duplicate service-name rejection.
+
 ## Bring Your Own Web App Targets
 
 Pantheon now supports a safe BYO web-app workflow:
@@ -154,8 +184,8 @@ pantheon/
 
 ## Next Engineering Step
 
-The production backend path now covers the full demo workflow: auth, templates, scenarios, labs, simulations, logs, AI analysis, defenses, comparisons, reports, dashboard serving, fake service containers, and Kubernetes Job-based traffic/attack runners. The next implementation steps are:
+The production backend path now covers the full demo workflow: auth, templates, scenarios, labs, simulations, logs, AI analysis, defenses, comparisons, reports, dashboard serving, fake service containers, Kubernetes Job-based traffic/attack runners, Alembic migration scaffolding, and initial API tests. The next implementation steps are:
 
-- add Alembic migrations instead of `create_all`
-- add automated API tests once dependencies are installed
 - add CI image builds and Kind integration tests
+- add live Kubernetes pod/job status polling
+- replace more generated logs with observed pod and service logs

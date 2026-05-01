@@ -29,6 +29,7 @@ class Settings:
     runner_image: str = os.getenv("KUBERNETES_RUNNER_IMAGE", "pantheon-runner:latest")
     runner_image_pull_policy: str = os.getenv("KUBERNETES_RUNNER_IMAGE_PULL_POLICY", "IfNotPresent")
     job_timeout_seconds: int = int(os.getenv("KUBERNETES_JOB_TIMEOUT_SECONDS", "120"))
+    auto_create_tables: bool = os.getenv("PANTHEON_AUTO_CREATE_TABLES", "true").lower() in {"1", "true", "yes", "on"}
     frontend_origins: list[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
