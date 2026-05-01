@@ -82,6 +82,26 @@ class KubernetesService:
             raise KubernetesProvisioningError(f"Unable to scale lab deployments in {namespace}: {exc}") from exc
         return results
 
+
+    def deploy_target_application(self, namespace: str, app: dict[str, Any]) -> list[ResourceResult]:
+        self._validate_namespace(namespace)
+        self._validate_services([app])
+        import_type = str(app.get("import_type") or "docker-image")
+        if self.is_dry_run:
+            return [
+                ResourceResult("Deployment", app["name"], "Created", f"Dry-run {import_type} target app deployment recorded."),
+                ResourceResult("Service", app["name"], "Created", "Dry-run internal ClusterIP service recorded."),
+            ]
+
+        self._connect()
+        if import_type == "kubernetes-yaml":
+            return self._apply_target_manifest(namespace, app)
+        if import_type == "local-service" and not app.get("image"):
+            raise KubernetesProvisioningError(
+                "Local-service targets must be containerized before real Kubernetes deployment. Provide an image or constrained YAML."
+            )
+        return [self._create_deployment(namespace, app), self._create_service(namespace, app)]
+
     def _connect(self) -> None:
         if self._core and self._apps and self._networking and self._batch:
             return
@@ -386,17 +406,78 @@ class KubernetesService:
 
         service_type = service["type"]
         service_name = service["name"]
-        return (
-            self.settings.service_image,
-            8080,
-            [
-                client.V1EnvVar(name="SERVICE_NAME", value=service_name),
-                client.V1EnvVar(name="SERVICE_TYPE", value=service_type),
-                client.V1EnvVar(name="PORT", value="8080"),
-                client.V1EnvVar(name="PANTHEON_INPUT_VALIDATION", value="false"),
-                client.V1EnvVar(name="PANTHEON_ADMIN_RESTRICTED", value="false"),
-            ],
-        )
+        container_port = int(service.get("container_port") or service.get("port") or 8080)
+        image = service.get("image") or self.settings.service_image
+        env = [
+            client.V1EnvVar(name="SERVICE_NAME", value=service_name),
+            client.V1EnvVar(name="SERVICE_TYPE", value=service_type),
+            client.V1EnvVar(name="PORT", value=str(container_port)),
+            client.V1EnvVar(name="PANTHEON_INPUT_VALIDATION", value="false"),
+            client.V1EnvVar(name="PANTHEON_ADMIN_RESTRICTED", value="false"),
+        ]
+        if service_type == "target-app":
+            env.extend(
+                [
+                    client.V1EnvVar(name="PANTHEON_TARGET_APP", value="true"),
+                    client.V1EnvVar(name="PANTHEON_HEALTH_PATH", value=str(service.get("health_path") or "/")),
+                ]
+            )
+        return (image, container_port, env)
+
+    def _apply_target_manifest(self, namespace: str, app: dict[str, Any]) -> list[ResourceResult]:
+        from kubernetes import client, utils
+        from kubernetes.client import ApiException
+        import yaml
+
+        manifest = app.get("manifest")
+        if not manifest:
+            raise KubernetesProvisioningError("Kubernetes YAML import requires a manifest.")
+        try:
+            documents = [item for item in yaml.safe_load_all(manifest) if item]
+        except yaml.YAMLError as exc:
+            raise KubernetesProvisioningError(f"Unable to parse target application YAML: {exc}") from exc
+        if not documents:
+            raise KubernetesProvisioningError("Kubernetes YAML import did not contain any resources.")
+
+        results: list[ResourceResult] = []
+        api_client = client.ApiClient()
+        for document in documents:
+            self._validate_target_manifest_document(document, app["name"])
+            document.setdefault("metadata", {})["namespace"] = namespace
+            try:
+                utils.create_from_dict(api_client, document, namespace=namespace)
+                results.append(ResourceResult(document["kind"], document["metadata"]["name"], "Created"))
+            except ApiException as exc:
+                if exc.status == 409:
+                    results.append(ResourceResult(document["kind"], document["metadata"]["name"], "Exists"))
+                    continue
+                raise KubernetesProvisioningError(f"Unable to apply target manifest resource: {exc}") from exc
+        return results
+
+    def _validate_target_manifest_document(self, document: dict[str, Any], service_name: str) -> None:
+        kind = document.get("kind")
+        metadata = document.get("metadata") or {}
+        name = metadata.get("name")
+        if kind not in {"Deployment", "Service"}:
+            raise KubernetesProvisioningError("Target app YAML may only contain Deployment and Service resources.")
+        if name != service_name:
+            raise KubernetesProvisioningError("Target app YAML resource names must match the registered service name.")
+        if metadata.get("namespace"):
+            raise KubernetesProvisioningError("Target app YAML must not force a namespace; Pantheon injects the lab namespace.")
+        spec = document.get("spec") or {}
+        if kind == "Service" and spec.get("type") in {"NodePort", "LoadBalancer", "ExternalName"}:
+            raise KubernetesProvisioningError("Target app services must remain internal ClusterIP services.")
+        if kind == "Deployment":
+            template = (spec.get("template") or {}).get("spec") or {}
+            if template.get("hostNetwork") or template.get("hostPID") or template.get("hostIPC"):
+                raise KubernetesProvisioningError("Target app pods cannot use host namespaces.")
+            for volume in template.get("volumes") or []:
+                if "hostPath" in volume:
+                    raise KubernetesProvisioningError("Target app pods cannot mount hostPath volumes.")
+            for container in template.get("containers") or []:
+                security = container.get("securityContext") or {}
+                if security.get("privileged"):
+                    raise KubernetesProvisioningError("Target app containers cannot be privileged.")
 
     def _create_runner_job(
         self,
@@ -535,6 +616,13 @@ class KubernetesService:
             name = str(service.get("name", ""))
             if not name or any(part in name for part in ("..", "/", "\\", ":", "*", "?")):
                 raise KubernetesProvisioningError(f"Invalid service name: {name}")
+            if service.get("type") == "target-app" and service.get("import_type") in {"docker-image", "local-service"}:
+                if not service.get("image") and service.get("import_type") != "local-service":
+                    raise KubernetesProvisioningError(f"Target app {name} requires an image.")
+                if not self.is_dry_run and not service.get("image") and service.get("import_type") == "local-service":
+                    raise KubernetesProvisioningError(
+                        f"Target app {name} is a local-service target and must be containerized before real deployment."
+                    )
 
     def _validate_scenario_targets(self, scenario_config: dict[str, Any], services: list[dict[str, Any]]) -> None:
         service_names = {service["name"] for service in services}

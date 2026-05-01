@@ -99,6 +99,22 @@ minikube image load pantheon-fake-service:latest
 minikube image load pantheon-runner:latest
 ```
 
+
+## Bring Your Own Web App Targets
+
+Pantheon now supports a safe BYO web-app workflow:
+
+1. Create or open a lab.
+2. Add a web app target from the `Web App Targets` panel.
+3. Use a Docker image, constrained Kubernetes YAML, or local-service metadata.
+4. Pantheon registers the app as an internal service in the selected lab.
+5. Create a custom scenario against that service name.
+6. Run the scenario and review the containment, path, risk, AI, defense, and report indicators.
+
+Custom scenarios cannot target public URLs, IP addresses, or domains. They must target a service that already belongs to the selected lab.
+
+Detailed requirements are in `docs/PRD-BYO-Web-App.md`.
+
 ## Demo Flow
 
 1. Login with the demo student account.

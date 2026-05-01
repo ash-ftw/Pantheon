@@ -10,6 +10,7 @@ from app.models import (
     Report,
     SimulationLog,
     SimulationRun,
+    TargetApplication,
 )
 
 
@@ -34,6 +35,8 @@ def scenario_to_api(scenario: AttackScenario) -> dict:
         "allowedTemplateIds": config.get("allowed_template_ids", []),
         "targetServices": config.get("target_services", []),
         "defaultRisk": config.get("default_risk", "Medium"),
+        "isCustom": bool(config.get("is_custom")),
+        "targetLabId": config.get("custom_lab_id"),
     }
 
 
@@ -52,6 +55,7 @@ def lab_to_api(lab: Lab) -> dict:
         "deletedAt": lab.deleted_at,
         "template": template_to_api(lab.template),
         "services": [service_to_api(item) for item in lab.services],
+        "targetApplications": [target_application_to_api(item) for item in lab.target_applications],
         "activeDefenses": [defense_action_to_api(item) for item in lab.defense_actions if item.status == "Applied"],
         "latestSimulation": simulation_to_api(latest_simulation) if latest_simulation else None,
     }
@@ -69,6 +73,24 @@ def service_to_api(service) -> dict:
         "port": service.port,
         "exposed": service.exposed,
         "createdAt": service.created_at,
+    }
+
+
+def target_application_to_api(target: TargetApplication) -> dict:
+    return {
+        "id": target.id,
+        "labId": target.lab_id,
+        "appName": target.app_name,
+        "serviceName": target.service_name,
+        "importType": target.import_type,
+        "image": target.image,
+        "port": target.port,
+        "healthPath": target.health_path,
+        "status": target.status,
+        "internalUrl": target.internal_url,
+        "safetyState": target.safety_state,
+        "manifestJson": target.manifest_json,
+        "createdAt": target.created_at,
     }
 
 

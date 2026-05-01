@@ -52,6 +52,8 @@ class ScenarioOut(BaseModel):
     allowedTemplateIds: list[str]
     targetServices: list[str]
     defaultRisk: str
+    isCustom: bool = False
+    targetLabId: str | None = None
 
 
 class LabCreate(BaseModel):
@@ -76,6 +78,56 @@ class ServiceInstanceOut(BaseModel):
     createdAt: datetime
 
 
+class TargetApplicationCreate(BaseModel):
+    app_name: str | None = None
+    appName: str | None = None
+    service_name: str | None = None
+    serviceName: str | None = None
+    import_type: str | None = None
+    importType: str | None = None
+    image: str | None = None
+    port: int = Field(default=8080, ge=1, le=65535)
+    health_path: str | None = None
+    healthPath: str | None = None
+    manifest: str | None = None
+    local_url: str | None = None
+    localUrl: str | None = None
+    normal_paths: list[str] | None = None
+    normalPaths: list[str] | None = None
+
+
+class TargetApplicationOut(BaseModel):
+    id: str
+    labId: str
+    appName: str
+    serviceName: str
+    importType: str
+    image: str | None
+    port: int
+    healthPath: str
+    status: str
+    internalUrl: str
+    safetyState: str
+    manifestJson: dict[str, Any]
+    createdAt: datetime
+
+
+class CustomScenarioCreate(BaseModel):
+    name: str = Field(default="Custom Web App Probe", min_length=1, max_length=180)
+    attack_type: str | None = None
+    attackType: str | None = None
+    target_service: str | None = None
+    targetService: str | None = None
+    method: str = "GET"
+    endpoint: str = "/"
+    payload_category: str | None = None
+    payloadCategory: str | None = None
+    request_count: int | None = Field(default=None, ge=1, le=100)
+    requestCount: int | None = Field(default=None, ge=1, le=100)
+    risk_level: str | None = None
+    riskLevel: str | None = None
+
+
 class LabOut(BaseModel):
     id: str
     userId: str
@@ -89,6 +141,7 @@ class LabOut(BaseModel):
     deletedAt: datetime | None
     template: TemplateOut
     services: list[ServiceInstanceOut]
+    targetApplications: list[TargetApplicationOut] = []
     activeDefenses: list[dict[str, Any]] = []
     latestSimulation: dict[str, Any] | None = None
 

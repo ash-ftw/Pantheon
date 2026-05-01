@@ -448,6 +448,119 @@ button {
   color: var(--cyan);
 }
 
+
+.indicator-track {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin: 10px 0 14px;
+}
+
+.indicator {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  align-items: center;
+  min-height: 62px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fbfcfe;
+}
+
+.indicator strong {
+  line-height: 1.1;
+}
+
+.indicator small {
+  grid-column: 2;
+  color: var(--muted);
+  font-size: 0.76rem;
+  overflow-wrap: anywhere;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.indicator.good .dot {
+  background: var(--green);
+}
+
+.indicator.info .dot {
+  background: var(--cyan);
+}
+
+.subpanel {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fbfcfe;
+  padding: 12px;
+}
+
+.subpanel h3 {
+  margin: 0 0 12px;
+}
+
+.panel-header.compact {
+  margin-bottom: 10px;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.form-grid.wide {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.span-2 {
+  grid-column: span 2;
+}
+
+textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 11px 12px;
+  outline: none;
+  resize: vertical;
+  font: inherit;
+  min-height: 96px;
+}
+
+textarea:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.target-layout {
+  grid-template-columns: minmax(320px, 0.9fr) minmax(280px, 1fr);
+}
+
+.target-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 12px;
+}
+
+.target-service {
+  border-color: #99f6e4;
+  box-shadow: inset 3px 0 0 var(--cyan);
+}
+
+.custom-scenario-panel {
+  margin-top: 12px;
+}
+
 .empty {
   border: 1px dashed var(--line);
   border-radius: var(--radius);
@@ -638,8 +751,14 @@ td {
   }
 
   .workspace,
-  .two-col {
+  .two-col,
+  .target-layout {
     grid-template-columns: 1fr;
+  }
+
+  .indicator-track,
+  .form-grid.wide {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .metric-grid {
@@ -667,8 +786,15 @@ td {
     padding: 12px;
   }
 
-  .metric-grid {
+  .metric-grid,
+  .indicator-track,
+  .form-grid,
+  .form-grid.wide {
     grid-template-columns: 1fr;
+  }
+
+  .span-2 {
+    grid-column: auto;
   }
 
   .button-row {

@@ -35,16 +35,57 @@ def defense_catalog_by_id(catalog_id: str) -> dict[str, Any] | None:
     return next((item for item in DEFENSES if item["id"] == catalog_id), None)
 
 
+def service_definitions_for_lab(lab: Lab) -> list[dict[str, Any]]:
+    target_by_service = {target.service_name: target for target in lab.target_applications}
+    definitions: list[dict[str, Any]] = []
+
+    if lab.services:
+        for item in lab.services:
+            definition: dict[str, Any] = {
+                "name": item.service_name,
+                "type": item.service_type,
+                "port": item.port,
+                "exposed": item.exposed,
+            }
+            target = target_by_service.get(item.service_name)
+            if target:
+                definition.update(
+                    {
+                        "image": target.image,
+                        "import_type": target.import_type,
+                        "health_path": target.health_path,
+                        "manifest": target.manifest_json.get("manifest"),
+                        "local_url": target.manifest_json.get("local_url"),
+                        "normal_paths": target.manifest_json.get("normal_paths", []),
+                    }
+                )
+            definitions.append(definition)
+
+    if definitions:
+        return definitions
+    return lab.template.service_config_json.get("services", [])
+
+
+def normal_traffic_for_lab(lab: Lab) -> list[str]:
+    traffic = list(lab.template.normal_traffic_json)
+    for target in lab.target_applications:
+        for entry in target.manifest_json.get("normal_paths", []):
+            if isinstance(entry, str) and entry not in traffic:
+                traffic.append(entry)
+    return traffic
+
+
 def run_simulation(db: Session, lab: Lab, scenario: AttackScenario) -> SimulationRun:
     template = lab.template
     config = scenario.scenario_config_json
-    service_definitions = template.service_config_json.get("services", [])
+    service_definitions = service_definitions_for_lab(lab)
+    normal_traffic = normal_traffic_for_lab(lab)
     normalized_config = _normalized_scenario_config(config, service_definitions)
     active_actions = active_defense_actions(db, lab.id)
     active_action_types = {action.action_type for action in active_actions}
     started_at = utcnow()
     simulation_id = uuid_str()
-    generated_logs = _normal_logs(lab.id, simulation_id, template.normal_traffic_json, service_definitions, started_at)
+    generated_logs = _normal_logs(lab.id, simulation_id, normal_traffic, service_definitions, started_at)
     reached_services: list[str] = []
     path_steps: list[dict[str, Any]] = []
     suspicious_event_count = 0
@@ -99,7 +140,7 @@ def run_simulation(db: Session, lab: Lab, scenario: AttackScenario) -> Simulatio
                 simulation_id=simulation_id,
                 services=service_definitions,
                 scenario_config=normalized_config,
-                normal_traffic=template.normal_traffic_json,
+                normal_traffic=normal_traffic,
             )
         ]
         attack_logs = [
@@ -212,6 +253,16 @@ def create_report(db: Session, simulation: SimulationRun) -> Report:
                 "status": lab.status,
             },
             "organizationTemplate": lab.template.name,
+            "targetApplications": [
+                {
+                    "appName": target.app_name,
+                    "serviceName": target.service_name,
+                    "internalUrl": target.internal_url,
+                    "status": target.status,
+                    "safetyState": target.safety_state,
+                }
+                for target in lab.target_applications
+            ],
             "attackScenario": {
                 "id": scenario.id,
                 "name": scenario.scenario_name,
@@ -280,7 +331,7 @@ def apply_defenses(
         KubernetesService().apply_defense(
             lab.namespace,
             catalog["action_type"],
-            lab.template.service_config_json.get("services", []),
+            service_definitions_for_lab(lab),
         )
     db.commit()
     for action in applied:

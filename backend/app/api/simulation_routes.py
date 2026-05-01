@@ -8,7 +8,7 @@ from app.dependencies import can_access_lab, get_current_user
 from app.models import AIAnalysis, AttackScenario, DefenseRecommendation, Lab, SimulationRun, User
 from app.schemas import SimulationCreate
 from app.services.presenters import analysis_to_api, log_to_api, recommendation_to_api, simulation_to_api
-from app.services.simulation_service import run_simulation
+from app.services.simulation_service import run_simulation, service_definitions_for_lab
 
 router = APIRouter(tags=["simulations"])
 
@@ -16,7 +16,12 @@ router = APIRouter(tags=["simulations"])
 def _load_lab(db: Session, lab_id: str) -> Lab | None:
     return (
         db.query(Lab)
-        .options(joinedload(Lab.template), joinedload(Lab.services), joinedload(Lab.defense_actions))
+        .options(
+            joinedload(Lab.template),
+            joinedload(Lab.services),
+            joinedload(Lab.target_applications),
+            joinedload(Lab.defense_actions),
+        )
         .filter(Lab.id == lab_id)
         .first()
     )
@@ -38,6 +43,22 @@ def _load_simulation(db: Session, simulation_id: str) -> SimulationRun | None:
     )
 
 
+def _validate_scenario_for_lab(lab: Lab, scenario: AttackScenario) -> None:
+    config = scenario.scenario_config_json
+    custom_lab_id = config.get("custom_lab_id")
+    if custom_lab_id:
+        if custom_lab_id != lab.id:
+            raise HTTPException(status_code=400, detail="Custom scenario belongs to a different lab")
+    elif lab.template_id not in config.get("allowed_template_ids", []):
+        raise HTTPException(status_code=400, detail="Scenario is not compatible with this lab template")
+
+    service_names = {service["name"] for service in service_definitions_for_lab(lab)}
+    for step in config.get("steps", []):
+        target = step.get("target")
+        if custom_lab_id and target not in service_names:
+            raise HTTPException(status_code=400, detail="Custom scenario target is outside this lab")
+
+
 @router.post("/labs/{lab_id}/simulations", status_code=status.HTTP_201_CREATED)
 def create_simulation(
     lab_id: str,
@@ -56,8 +77,7 @@ def create_simulation(
     scenario = db.get(AttackScenario, scenario_id)
     if not scenario:
         raise HTTPException(status_code=400, detail="Unknown scenario")
-    if lab.template_id not in scenario.scenario_config_json.get("allowed_template_ids", []):
-        raise HTTPException(status_code=400, detail="Scenario is not compatible with this lab template")
+    _validate_scenario_for_lab(lab, scenario)
 
     simulation = run_simulation(db, lab, scenario)
     loaded = _load_simulation(db, simulation.id)

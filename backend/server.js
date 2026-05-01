@@ -390,6 +390,11 @@ function loadStore() {
 }
 
 let store = loadStore();
+store.customScenarios ||= [];
+for (const lab of store.labs) {
+  lab.targetApplications ||= [];
+}
+saveStore();
 
 function saveStore() {
   fs.writeFileSync(STORE_PATH, JSON.stringify(store, null, 2));
@@ -465,7 +470,22 @@ function findTemplate(id) {
 }
 
 function findScenario(id) {
-  return scenarioCatalog.find((scenario) => scenario.id === id);
+  return [...scenarioCatalog, ...(store.customScenarios || [])].find((scenario) => scenario.id === id);
+}
+
+function visibleScenariosForUser(user) {
+  const accessibleLabs = new Set(listLabsForUser(user).map((lab) => lab.id));
+  return [...scenarioCatalog, ...(store.customScenarios || [])].filter((scenario) => {
+    return !scenario.targetLabId || accessibleLabs.has(scenario.targetLabId);
+  });
+}
+
+function assertSafeServiceName(serviceName) {
+  return /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(serviceName) && serviceName.length <= 63;
+}
+
+function serviceNamesForLab(lab) {
+  return new Set((lab.services || []).map((service) => service.serviceName));
 }
 
 function normalizeTargetForTemplate(step, template) {
@@ -760,6 +780,13 @@ function createReport(simulation) {
         status: lab.status
       },
       organizationTemplate: template.name,
+      targetApplications: (lab.targetApplications || []).map((target) => ({
+        appName: target.appName,
+        serviceName: target.serviceName,
+        internalUrl: target.internalUrl,
+        status: target.status,
+        safetyState: target.safetyState
+      })),
       attackScenario: {
         id: scenario.id,
         name: scenario.name,
@@ -793,6 +820,7 @@ function labResponse(lab) {
     ...lab,
     template,
     services: lab.services,
+    targetApplications: lab.targetApplications || [],
     activeDefenses: appliedDefensesForLab(lab.id),
     latestSimulation: store.simulations.filter((simulation) => simulation.labId === lab.id).at(-1) || null
   };
@@ -900,14 +928,18 @@ async function handleApi(req, res, pathname) {
   }
 
   if (req.method === "GET" && pathname === "/api/scenarios") {
-    send(res, 200, { scenarios: scenarioCatalog });
+    const user = authenticate(req);
+    send(res, 200, { scenarios: user ? visibleScenariosForUser(user) : scenarioCatalog });
     return;
   }
 
   const scenarioMatch = pathname.match(/^\/api\/scenarios\/([^/]+)$/);
   if (req.method === "GET" && scenarioMatch) {
     const scenario = findScenario(scenarioMatch[1]);
-    if (!scenario) return sendError(res, 404, "Scenario not found");
+    const user = authenticate(req);
+    if (!scenario || (scenario.targetLabId && (!user || !visibleScenariosForUser(user).some((item) => item.id === scenario.id)))) {
+      return sendError(res, 404, "Scenario not found");
+    }
     send(res, 200, { scenario });
     return;
   }
@@ -932,6 +964,7 @@ async function handleApi(req, res, pathname) {
         deploymentMode: "Mock Kubernetes",
         createdAt,
         deletedAt: null,
+        targetApplications: [],
         services: template.services.map((service) => ({
           id: shortId("svc"),
           labId,
@@ -983,6 +1016,120 @@ async function handleApi(req, res, pathname) {
       return;
     }
 
+    const targetAppsMatch = pathname.match(/^\/api\/labs\/([^/]+)\/target-apps$/);
+    if (targetAppsMatch) {
+      const lab = store.labs.find((item) => item.id === targetAppsMatch[1]);
+      if (!lab || !canAccessLab(user, lab)) return sendError(res, 404, "Lab not found");
+      lab.targetApplications ||= [];
+      if (req.method === "GET") {
+        send(res, 200, { targetApplications: lab.targetApplications });
+        return;
+      }
+      if (req.method === "POST") {
+        const body = await readBody(req);
+        const appName = String(body.app_name || body.appName || "").trim();
+        const serviceName = String(body.service_name || body.serviceName || appName.toLowerCase().replace(/[^a-z0-9-]+/g, "-")).replace(/^-+|-+$/g, "");
+        const importType = String(body.import_type || body.importType || "docker-image").trim().toLowerCase();
+        const port = Number(body.port || 8080);
+        const healthPath = String(body.health_path || body.healthPath || "/").startsWith("/")
+          ? String(body.health_path || body.healthPath || "/")
+          : `/${body.health_path || body.healthPath}`;
+        if (!appName) return sendError(res, 400, "appName is required");
+        if (!assertSafeServiceName(serviceName)) return sendError(res, 400, "Service name must be a safe Kubernetes DNS label");
+        if (!Number.isInteger(port) || port < 1 || port > 65535) return sendError(res, 400, "port must be between 1 and 65535");
+        if (!new Set(["docker-image", "kubernetes-yaml", "local-service"]).has(importType)) return sendError(res, 400, "Unsupported import type");
+        if (serviceNamesForLab(lab).has(serviceName)) return sendError(res, 409, "A service with this name already exists in the lab");
+        if (importType === "docker-image" && !body.image) return sendError(res, 400, "Docker image import requires an image name");
+        if (importType === "kubernetes-yaml" && !body.manifest) return sendError(res, 400, "Kubernetes YAML import requires a manifest");
+        const createdAt = nowIso();
+        const target = {
+          id: shortId("target"),
+          labId: lab.id,
+          appName,
+          serviceName,
+          importType,
+          image: body.image || null,
+          port,
+          healthPath,
+          status: lab.status === "Running" ? "Running" : "Registered",
+          internalUrl: `http://${serviceName}:${port}`,
+          safetyState: "Contained",
+          manifestJson: {
+            manifest: body.manifest || null,
+            local_url: body.local_url || body.localUrl || null,
+            normal_paths: body.normal_paths || body.normalPaths || [`GET ${healthPath}`],
+            safety_boundary: "lab-namespace-only"
+          },
+          createdAt
+        };
+        lab.targetApplications.push(target);
+        lab.services.push({
+          id: shortId("svc"),
+          labId: lab.id,
+          serviceName,
+          serviceType: "target-app",
+          kubernetesDeploymentName: serviceName,
+          kubernetesServiceName: serviceName,
+          status: target.status,
+          port,
+          exposed: false,
+          createdAt
+        });
+        saveStore();
+        send(res, 201, { targetApplication: target, lab: labResponse(lab) });
+        return;
+      }
+    }
+
+    const customScenarioMatch = pathname.match(/^\/api\/labs\/([^/]+)\/custom-scenarios$/);
+    if (req.method === "POST" && customScenarioMatch) {
+      const lab = store.labs.find((item) => item.id === customScenarioMatch[1]);
+      if (!lab || !canAccessLab(user, lab)) return sendError(res, 404, "Lab not found");
+      const body = await readBody(req);
+      const targetService = String(body.target_service || body.targetService || "").trim();
+      if (!targetService || targetService.includes("://") || targetService.includes("/") || !serviceNamesForLab(lab).has(targetService)) {
+        return sendError(res, 400, "Custom scenario target must be an internal service in this lab");
+      }
+      let endpoint = String(body.endpoint || "/").trim() || "/";
+      if (endpoint.includes("://")) return sendError(res, 400, "Endpoint must be a path, not a URL");
+      if (!endpoint.startsWith("/")) endpoint = `/${endpoint}`;
+      const method = String(body.method || "GET").toUpperCase();
+      const allowedMethods = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]);
+      if (!allowedMethods.has(method)) return sendError(res, 400, "Unsupported HTTP method for safe scenario template");
+      const risk = ["Low", "Medium", "High", "Critical"].includes(body.risk_level || body.riskLevel) ? body.risk_level || body.riskLevel : "Medium";
+      const count = Math.max(1, Math.min(100, Number(body.request_count || body.requestCount || 12)));
+      const scenario = {
+        id: `custom-${lab.id.replace(/[^a-z0-9]/g, "").slice(0, 8)}-${crypto.randomBytes(4).toString("hex")}`,
+        name: body.name || "Custom Web App Probe",
+        description: `User-defined safe scenario targeting ${targetService} inside ${lab.namespace}.`,
+        difficulty: "Custom",
+        attackType: body.attack_type || body.attackType || "Custom Web App Probe",
+        allowedTemplateIds: [lab.templateId],
+        targetServices: [targetService],
+        defaultRisk: risk,
+        isCustom: true,
+        targetLabId: lab.id,
+        steps: [
+          {
+            order: 1,
+            actionType: "CUSTOM_WEB_APP_REQUEST_PATTERN",
+            source: "attack-pod",
+            target: targetService,
+            method,
+            endpoint,
+            eventType: "custom_web_app_signal",
+            payloadCategory: body.payload_category || body.payloadCategory || "custom_probe",
+            statusCode: 200,
+            count
+          }
+        ]
+      };
+      store.customScenarios.push(scenario);
+      saveStore();
+      send(res, 201, { scenario });
+      return;
+    }
+
     const labSimulationMatch = pathname.match(/^\/api\/labs\/([^/]+)\/simulations$/);
     if (req.method === "POST" && labSimulationMatch) {
       const lab = store.labs.find((item) => item.id === labSimulationMatch[1]);
@@ -991,7 +1138,13 @@ async function handleApi(req, res, pathname) {
       const body = await readBody(req);
       const scenario = findScenario(body.scenario_id || body.scenarioId);
       if (!scenario) return sendError(res, 400, "Unknown scenario");
-      if (!scenario.allowedTemplateIds.includes(lab.templateId)) {
+      if (scenario.targetLabId) {
+        if (scenario.targetLabId !== lab.id) return sendError(res, 400, "Custom scenario belongs to a different lab");
+        const serviceNames = serviceNamesForLab(lab);
+        if (scenario.steps.some((step) => !serviceNames.has(step.target))) {
+          return sendError(res, 400, "Custom scenario target is outside this lab");
+        }
+      } else if (!scenario.allowedTemplateIds.includes(lab.templateId)) {
         return sendError(res, 400, "Scenario is not compatible with this lab template");
       }
       const simulation = runSimulation(lab, scenario);

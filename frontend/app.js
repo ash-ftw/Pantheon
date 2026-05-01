@@ -44,7 +44,7 @@ async function api(path, options = {}) {
   const response = await fetch(path, { ...options, headers });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data.error || `Request failed with status ${response.status}`);
+    throw new Error(data.detail || data.error || `Request failed with status ${response.status}`);
   }
   return data;
 }
@@ -90,6 +90,11 @@ async function loadDashboard() {
     state.selectedLabId = state.labs[0]?.id || "";
     localStorage.setItem("pantheon_selected_lab", state.selectedLabId);
   }
+  const lab = selectedLab();
+  const scenarios = compatibleScenarios(lab);
+  if (scenarios.length && !scenarios.some((scenario) => scenario.id === state.selectedScenarioId)) {
+    state.selectedScenarioId = scenarios[0].id;
+  }
 }
 
 function selectedLab() {
@@ -98,7 +103,10 @@ function selectedLab() {
 
 function compatibleScenarios(lab) {
   if (!lab) return [];
-  return state.scenarios.filter((scenario) => scenario.allowedTemplateIds.includes(lab.templateId));
+  return state.scenarios.filter((scenario) => {
+    if (scenario.targetLabId) return scenario.targetLabId === lab.id;
+    return scenario.allowedTemplateIds.includes(lab.templateId);
+  });
 }
 
 function latestSimulationForLab(lab) {
@@ -192,6 +200,7 @@ function renderDashboard() {
           ${state.message ? `<div class="success">${escapeHtml(state.message)}</div>` : ""}
           ${renderMetrics()}
           ${lab ? renderLabDetail(lab, simulation) : renderNoLab()}
+          ${lab ? renderTargetApps(lab) : ""}
           ${lab ? renderScenarios(lab) : ""}
           ${simulation ? renderSimulation(simulation) : ""}
           ${state.report ? renderReport(state.report) : ""}
@@ -275,17 +284,19 @@ function renderMetrics() {
   const running = state.labs.filter((lab) => lab.status === "Running").length;
   const defenses = state.labs.reduce((total, lab) => total + lab.activeDefenses.length, 0);
   const latest = state.labs.map((lab) => lab.latestSimulation).filter(Boolean);
+  const targetApps = state.labs.reduce((total, lab) => total + (lab.targetApplications?.length || 0), 0);
   const critical = latest.filter((simulation) => simulation.riskLevel === "Critical").length;
   return `
     <section class="metric-grid">
       <div class="metric"><strong>${state.labs.length}</strong><span>Total labs</span></div>
       <div class="metric"><strong>${running}</strong><span>Running labs</span></div>
-      <div class="metric"><strong>${latest.length}</strong><span>Simulations</span></div>
+      <div class="metric"><strong>${targetApps}</strong><span>Imported apps</span></div>
       <div class="metric"><strong>${defenses}</strong><span>Applied defenses</span></div>
     </section>
     ${critical ? `<div class="alert">${critical} latest simulation(s) still show critical risk.</div>` : ""}
   `;
 }
+
 
 function renderNoLab() {
   return `
@@ -306,16 +317,19 @@ function renderLabDetail(lab, simulation) {
         <div class="badge-row">
           ${statusBadge(lab.status)}
           <span class="badge blue">${escapeHtml(lab.deploymentMode)}</span>
+          <span class="badge green">namespace isolated</span>
         </div>
       </div>
+      ${renderSafetyStrip(lab)}
       <div class="service-grid">
         ${lab.services
           .map(
             (service) => `
-              <div class="service">
+              <div class="service ${service.serviceType === "target-app" ? "target-service" : ""}">
                 <strong>${escapeHtml(service.serviceName)}</strong>
-                <div class="muted tiny">${escapeHtml(service.serviceType)} · ${escapeHtml(service.status)}</div>
+                <div class="muted tiny">${escapeHtml(service.serviceType)} - ${escapeHtml(service.status)}</div>
                 <div class="badge-row">
+                  ${service.serviceType === "target-app" ? `<span class="badge cyan">imported app</span>` : ""}
                   ${service.exposed ? `<span class="badge amber">exposed</span>` : `<span class="badge green">private</span>`}
                   ${service.port ? `<span class="badge">:${service.port}</span>` : ""}
                 </div>
@@ -337,16 +351,186 @@ function renderLabDetail(lab, simulation) {
   `;
 }
 
+function renderSafetyStrip(lab) {
+  return `
+    <div class="indicator-track">
+      <div class="indicator good"><span class="dot"></span><strong>Contained</strong><small>${escapeHtml(lab.namespace)}</small></div>
+      <div class="indicator good"><span class="dot"></span><strong>Internal-only</strong><small>No external URLs accepted</small></div>
+      <div class="indicator info"><span class="dot"></span><strong>${lab.services.length}</strong><small>lab services</small></div>
+      <div class="indicator info"><span class="dot"></span><strong>${lab.targetApplications?.length || 0}</strong><small>imported apps</small></div>
+    </div>
+  `;
+}
+
+function renderTargetApps(lab) {
+  const serviceOptions = lab.services
+    .map((service) => `<option value="${escapeHtml(service.serviceName)}">${escapeHtml(service.serviceName)} (${escapeHtml(service.serviceType)})</option>`)
+    .join("");
+  const targetCards = (lab.targetApplications || [])
+    .map(
+      (target) => `
+        <article class="target-card">
+          <div class="lab-title">
+            <div>
+              <h3>${escapeHtml(target.appName)}</h3>
+              <div class="muted tiny">${escapeHtml(target.internalUrl)}${escapeHtml(target.healthPath)}</div>
+            </div>
+            ${statusBadge(target.status)}
+          </div>
+          <div class="badge-row">
+            <span class="badge cyan">${escapeHtml(target.importType)}</span>
+            <span class="badge green">${escapeHtml(target.safetyState)}</span>
+            <span class="badge green">internal target</span>
+            ${target.image ? `<span class="badge">${escapeHtml(target.image)}</span>` : ""}
+          </div>
+        </article>
+      `
+    )
+    .join("");
+  return `
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h2>Web App Targets</h2>
+          <p>Import your app into this lab, then create custom internal-only scenarios against its service name.</p>
+        </div>
+        <span class="badge green">safe target registry</span>
+      </div>
+      <div class="two-col target-layout">
+        <form id="target-app-form" class="subpanel">
+          <h3>Add Web App</h3>
+          <div class="form-grid">
+            <div class="field">
+              <label for="target-app-name">App name</label>
+              <input id="target-app-name" name="app_name" value="My Web App" required />
+            </div>
+            <div class="field">
+              <label for="target-service-name">Internal service name</label>
+              <input id="target-service-name" name="service_name" value="my-web-app" required />
+            </div>
+            <div class="field">
+              <label for="target-import-type">Import type</label>
+              <select id="target-import-type" name="import_type">
+                <option value="docker-image">Docker image</option>
+                <option value="kubernetes-yaml">Kubernetes YAML</option>
+                <option value="local-service">Local service config</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="target-port">Port</label>
+              <input id="target-port" name="port" type="number" min="1" max="65535" value="8080" required />
+            </div>
+            <div class="field span-2">
+              <label for="target-image">Image</label>
+              <input id="target-image" name="image" placeholder="my-web-app:latest" />
+            </div>
+            <div class="field span-2">
+              <label for="target-health-path">Health path</label>
+              <input id="target-health-path" name="health_path" value="/" />
+            </div>
+            <div class="field span-2">
+              <label for="target-manifest">Kubernetes YAML / local notes</label>
+              <textarea id="target-manifest" name="manifest" rows="4" placeholder="Optional constrained Deployment + Service YAML"></textarea>
+            </div>
+          </div>
+          <button class="btn primary" type="submit" ${lab.status === "Deleted" ? "disabled" : ""}>Import app</button>
+        </form>
+        <div class="subpanel">
+          <div class="panel-header compact">
+            <div>
+              <h3>Registered Targets</h3>
+              <p>${lab.targetApplications?.length || 0} imported app(s) in this namespace.</p>
+            </div>
+          </div>
+          <div class="list">${targetCards || `<div class="empty">No imported web apps yet. Add one with a Docker image or constrained YAML.</div>`}</div>
+        </div>
+      </div>
+      <form id="custom-scenario-form" class="subpanel custom-scenario-panel">
+        <div class="panel-header compact">
+          <div>
+            <h3>Custom Scenario Builder</h3>
+            <p>Targets are limited to services already inside this lab.</p>
+          </div>
+          <span class="badge green">scope locked</span>
+        </div>
+        <div class="form-grid wide">
+          <div class="field">
+            <label for="custom-name">Scenario name</label>
+            <input id="custom-name" name="name" value="Custom App Probe" required />
+          </div>
+          <div class="field">
+            <label for="custom-target">Target service</label>
+            <select id="custom-target" name="target_service">${serviceOptions}</select>
+          </div>
+          <div class="field">
+            <label for="custom-attack-type">Attack type</label>
+            <select id="custom-attack-type" name="attack_type">
+              <option>Custom Web App Probe</option>
+              <option>SQL Injection</option>
+              <option>Brute Force</option>
+              <option>DDoS-Style Traffic</option>
+              <option>Privilege Escalation</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="custom-method">Method</label>
+            <select id="custom-method" name="method">
+              <option>GET</option>
+              <option>POST</option>
+              <option>PUT</option>
+              <option>PATCH</option>
+              <option>DELETE</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="custom-endpoint">Endpoint path</label>
+            <input id="custom-endpoint" name="endpoint" value="/login" required />
+          </div>
+          <div class="field">
+            <label for="custom-payload">Payload category</label>
+            <select id="custom-payload" name="payload_category">
+              <option value="custom_probe">custom_probe</option>
+              <option value="sql_meta_characters">sql_meta_characters</option>
+              <option value="credential_attempt">credential_attempt</option>
+              <option value="controlled_high_volume">controlled_high_volume</option>
+              <option value="low_privilege_token">low_privilege_token</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="custom-count">Request count</label>
+            <input id="custom-count" name="request_count" type="number" min="1" max="100" value="12" required />
+          </div>
+          <div class="field">
+            <label for="custom-risk">Risk</label>
+            <select id="custom-risk" name="risk_level">
+              <option>Medium</option>
+              <option>High</option>
+              <option>Critical</option>
+              <option>Low</option>
+            </select>
+          </div>
+        </div>
+        <button class="btn primary" type="submit" ${!lab.services.length ? "disabled" : ""}>Create custom scenario</button>
+      </form>
+    </section>
+  `;
+}
+
+
 function renderScenarios(lab) {
   const scenarios = compatibleScenarios(lab);
+  const selected = scenarios.some((scenario) => scenario.id === state.selectedScenarioId)
+    ? state.selectedScenarioId
+    : scenarios[0]?.id;
+  if (selected && selected !== state.selectedScenarioId) state.selectedScenarioId = selected;
   return `
     <section class="panel">
       <div class="panel-header">
         <div>
           <h2>Attack Scenarios</h2>
-          <p>Preset internal-only simulations for the selected template.</p>
+          <p>Preset and custom internal-only simulations for the selected lab.</p>
         </div>
-        <button class="btn primary" data-action="run-simulation" ${lab.status !== "Running" ? "disabled" : ""}>Run selected</button>
+        <button class="btn primary" data-action="run-simulation" ${lab.status !== "Running" || !selected ? "disabled" : ""}>Run selected</button>
       </div>
       <div class="list">
         ${scenarios
@@ -356,21 +540,24 @@ function renderScenarios(lab) {
                 <div class="scenario-title">
                   <div>
                     <h3>${escapeHtml(scenario.name)}</h3>
-                    <div class="muted tiny">${escapeHtml(scenario.attackType)} · ${escapeHtml(scenario.difficulty)}</div>
+                    <div class="muted tiny">${escapeHtml(scenario.attackType)} - ${escapeHtml(scenario.difficulty)}</div>
                   </div>
                   ${riskBadge(scenario.defaultRisk)}
                 </div>
                 <div class="badge-row">
+                  <span class="badge ${scenario.isCustom ? "cyan" : "blue"}">${scenario.isCustom ? "custom" : "preset"}</span>
+                  <span class="badge green">internal-only</span>
                   ${scenario.targetServices.slice(0, 5).map((service) => `<span class="badge">${escapeHtml(service)}</span>`).join("")}
                 </div>
               </article>
             `
           )
-          .join("")}
+          .join("") || `<div class="empty">No compatible scenarios yet. Create a custom scenario for this lab.</div>`}
       </div>
     </section>
   `;
 }
+
 
 function renderSimulation(simulation) {
   return `
@@ -655,6 +842,48 @@ app.addEventListener("submit", async (event) => {
       state.message = "Lab created and marked running in mock Kubernetes mode.";
       state.report = null;
       state.simulation = null;
+      render();
+    }
+    if (event.target.id === "target-app-form") {
+      const lab = selectedLab();
+      if (!lab) return;
+      await api(`/api/labs/${lab.id}/target-apps`, {
+        method: "POST",
+        body: JSON.stringify({
+          app_name: form.get("app_name"),
+          service_name: form.get("service_name"),
+          import_type: form.get("import_type"),
+          image: form.get("image"),
+          port: Number(form.get("port") || 8080),
+          health_path: form.get("health_path"),
+          manifest: form.get("manifest"),
+          normal_paths: [`GET ${form.get("health_path") || "/"}`]
+        })
+      });
+      await loadDashboard();
+      state.message = "Web app target imported and locked to this lab namespace.";
+      state.report = null;
+      render();
+    }
+    if (event.target.id === "custom-scenario-form") {
+      const lab = selectedLab();
+      if (!lab) return;
+      const result = await api(`/api/labs/${lab.id}/custom-scenarios`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: form.get("name"),
+          attack_type: form.get("attack_type"),
+          target_service: form.get("target_service"),
+          method: form.get("method"),
+          endpoint: form.get("endpoint"),
+          payload_category: form.get("payload_category"),
+          request_count: Number(form.get("request_count") || 12),
+          risk_level: form.get("risk_level")
+        })
+      });
+      state.selectedScenarioId = result.scenario.id;
+      await loadDashboard();
+      state.message = "Custom scenario created. It can only target services inside this lab.";
       render();
     }
   } catch (error) {

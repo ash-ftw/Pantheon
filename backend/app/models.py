@@ -85,6 +85,11 @@ class Lab(Base):
         order_by="SimulationRun.started_at",
     )
     defense_actions: Mapped[list["DefenseAction"]] = relationship(back_populates="lab", cascade="all, delete-orphan")
+    target_applications: Mapped[list["TargetApplication"]] = relationship(
+        back_populates="lab",
+        cascade="all, delete-orphan",
+        order_by="TargetApplication.created_at",
+    )
 
 
 class ServiceInstance(Base):
@@ -103,6 +108,27 @@ class ServiceInstance(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     lab: Mapped["Lab"] = relationship(back_populates="services")
+
+
+class TargetApplication(Base):
+    __tablename__ = "target_applications"
+    __table_args__ = (UniqueConstraint("lab_id", "service_name", name="uq_target_app_lab_service"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    lab_id: Mapped[str] = mapped_column(String(36), ForeignKey("labs.id"), index=True, nullable=False)
+    app_name: Mapped[str] = mapped_column(String(140), nullable=False)
+    service_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    import_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    image: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    port: Mapped[int] = mapped_column(Integer, default=8080, nullable=False)
+    health_path: Mapped[str] = mapped_column(String(240), default="/", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Registered", nullable=False)
+    internal_url: Mapped[str] = mapped_column(String(255), nullable=False)
+    safety_state: Mapped[str] = mapped_column(String(40), default="Contained", nullable=False)
+    manifest_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    lab: Mapped["Lab"] = relationship(back_populates="target_applications")
 
 
 class SimulationRun(Base):

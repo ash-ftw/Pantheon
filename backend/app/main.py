@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import auth_routes, defense_routes, lab_routes, report_routes, scenario_routes, simulation_routes, template_routes
+from app.api import auth_routes, defense_routes, lab_routes, report_routes, scenario_routes, simulation_routes, target_app_routes, template_routes
 from app.config import settings
 from app.database import SessionLocal, init_db
 from app.seed import seed_database
@@ -53,6 +53,7 @@ app.include_router(template_routes.router, prefix=settings.api_prefix)
 app.include_router(scenario_routes.router, prefix=settings.api_prefix)
 app.include_router(lab_routes.router, prefix=settings.api_prefix)
 app.include_router(simulation_routes.router, prefix=settings.api_prefix)
+app.include_router(target_app_routes.router, prefix=settings.api_prefix)
 app.include_router(defense_routes.router, prefix=settings.api_prefix)
 app.include_router(report_routes.router, prefix=settings.api_prefix)
 

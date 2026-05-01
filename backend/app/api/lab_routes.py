@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.config import settings
 from app.database import get_db
 from app.dependencies import can_access_lab, get_current_user
-from app.models import Lab, OrganizationTemplate, ServiceInstance, User
+from app.models import Lab, OrganizationTemplate, ServiceInstance, TargetApplication, User
 from app.schemas import LabCreate, LabOut
 from app.services.kubernetes_service import KubernetesProvisioningError, KubernetesService
 from app.services.presenters import lab_to_api
@@ -19,7 +19,7 @@ router = APIRouter(prefix="/labs", tags=["labs"])
 def _load_lab(db: Session, lab_id: str) -> Lab | None:
     return (
         db.query(Lab)
-        .options(joinedload(Lab.template), joinedload(Lab.services))
+        .options(joinedload(Lab.template), joinedload(Lab.services), joinedload(Lab.target_applications))
         .filter(Lab.id == lab_id)
         .first()
     )
@@ -70,7 +70,11 @@ def create_lab(payload: LabCreate, db: Session = Depends(get_db), user: User = D
 
 @router.get("", response_model=dict[str, list[LabOut]])
 def list_labs(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> dict:
-    query = db.query(Lab).options(joinedload(Lab.template), joinedload(Lab.services)).order_by(Lab.created_at.desc())
+    query = (
+        db.query(Lab)
+        .options(joinedload(Lab.template), joinedload(Lab.services), joinedload(Lab.target_applications))
+        .order_by(Lab.created_at.desc())
+    )
     if user.role not in {"Admin", "Instructor"}:
         query = query.filter(Lab.user_id == user.id)
     return {"labs": [lab_to_api(item) for item in query.all()]}
@@ -144,18 +148,31 @@ def _scale_lab(lab_id: str, replicas: int, db: Session, user: User) -> dict:
 
 
 def _service_definitions_for_lab(lab: Lab) -> list[dict]:
-    template_services = lab.template.service_config_json.get("services", [])
-    if template_services:
-        return template_services
-    return [
-        {
-            "name": item.service_name,
-            "type": item.service_type,
-            "port": item.port,
-            "exposed": item.exposed,
-        }
-        for item in lab.services
-    ]
+    target_by_service = {target.service_name: target for target in lab.target_applications}
+    if lab.services:
+        definitions: list[dict] = []
+        for item in lab.services:
+            definition = {
+                "name": item.service_name,
+                "type": item.service_type,
+                "port": item.port,
+                "exposed": item.exposed,
+            }
+            target = target_by_service.get(item.service_name)
+            if target:
+                definition.update(
+                    {
+                        "image": target.image,
+                        "import_type": target.import_type,
+                        "health_path": target.health_path,
+                        "manifest": target.manifest_json.get("manifest"),
+                        "local_url": target.manifest_json.get("local_url"),
+                        "normal_paths": target.manifest_json.get("normal_paths", []),
+                    }
+                )
+            definitions.append(definition)
+        return definitions
+    return lab.template.service_config_json.get("services", [])
 
 
 def _ensure_service_instances(db: Session, lab: Lab, service_definitions: list[dict], status: str) -> None:
