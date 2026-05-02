@@ -4,10 +4,12 @@ import json
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from app.config import Settings, settings
+
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 class KubernetesProvisioningError(RuntimeError):
@@ -166,6 +168,7 @@ class KubernetesService:
         services: list[dict[str, Any]],
         scenario_config: dict[str, Any],
         normal_traffic: list[str],
+        progress_callback: ProgressCallback | None = None,
     ) -> list[dict[str, Any]]:
         self._validate_namespace(namespace)
         self._validate_services(services)
@@ -190,6 +193,7 @@ class KubernetesService:
                         "SERVICES_JSON": json.dumps(services),
                         "NORMAL_TRAFFIC_JSON": json.dumps(normal_traffic),
                     },
+                    progress_callback=progress_callback,
                 )
             )
             results.extend(
@@ -203,8 +207,10 @@ class KubernetesService:
                         "SERVICES_JSON": json.dumps(services),
                         "SCENARIO_CONFIG_JSON": json.dumps(scenario_config),
                     },
+                    progress_callback=progress_callback,
                 )
             )
+            results.extend(self._read_service_pod_logs(namespace, services, simulation_id, progress_callback))
         finally:
             self._delete_job(namespace, traffic_job)
             self._delete_job(namespace, attack_job)
@@ -347,13 +353,24 @@ class KubernetesService:
         from kubernetes.client import ApiException
 
         same_namespace_peer = client.V1NetworkPolicyPeer(pod_selector=client.V1LabelSelector())
+        kube_dns_peer = client.V1NetworkPolicyPeer(
+            namespace_selector=client.V1LabelSelector(match_labels={"kubernetes.io/metadata.name": "kube-system"}),
+            pod_selector=client.V1LabelSelector(match_labels={"k8s-app": "kube-dns"}),
+        )
+        dns_ports = [
+            client.V1NetworkPolicyPort(protocol="UDP", port=53),
+            client.V1NetworkPolicyPort(protocol="TCP", port=53),
+        ]
         body = client.V1NetworkPolicy(
             metadata=client.V1ObjectMeta(name="pantheon-namespace-isolation"),
             spec=client.V1NetworkPolicySpec(
                 pod_selector=client.V1LabelSelector(),
                 policy_types=["Ingress", "Egress"],
                 ingress=[client.V1NetworkPolicyIngressRule(_from=[same_namespace_peer])],
-                egress=[client.V1NetworkPolicyEgressRule(to=[same_namespace_peer])],
+                egress=[
+                    client.V1NetworkPolicyEgressRule(to=[same_namespace_peer]),
+                    client.V1NetworkPolicyEgressRule(to=[kube_dns_peer], ports=dns_ports),
+                ],
             ),
         )
         try:
@@ -619,6 +636,7 @@ class KubernetesService:
         job_name: str,
         command: list[str],
         env: dict[str, str],
+        progress_callback: ProgressCallback | None = None,
     ) -> list[dict[str, Any]]:
         records = [
             self._observed_log_record(
@@ -628,6 +646,13 @@ class KubernetesService:
                 raw={"command": command, "env_keys": sorted(env)},
             )
         ]
+        self._emit_progress(
+            progress_callback,
+            "kubernetes_job_creating",
+            simulationId=simulation_id,
+            jobName=job_name,
+            namespace=namespace,
+        )
         self._create_runner_job(namespace=namespace, job_name=job_name, command=command, env=env)
         records.append(
             self._observed_log_record(
@@ -637,11 +662,24 @@ class KubernetesService:
                 raw={"namespace": namespace},
             )
         )
-        records.extend(self._wait_for_job(namespace, job_name, simulation_id))
-        records.extend(self._read_job_observed_logs(namespace, job_name, simulation_id))
+        self._emit_progress(
+            progress_callback,
+            "kubernetes_job_created",
+            simulationId=simulation_id,
+            jobName=job_name,
+            namespace=namespace,
+        )
+        records.extend(self._wait_for_job(namespace, job_name, simulation_id, progress_callback))
+        records.extend(self._read_job_observed_logs(namespace, job_name, simulation_id, progress_callback))
         return records
 
-    def _wait_for_job(self, namespace: str, job_name: str, simulation_id: str) -> list[dict[str, Any]]:
+    def _wait_for_job(
+        self,
+        namespace: str,
+        job_name: str,
+        simulation_id: str,
+        progress_callback: ProgressCallback | None = None,
+    ) -> list[dict[str, Any]]:
         deadline = time.time() + self.settings.job_timeout_seconds
         last_phase: str | None = None
         records: list[dict[str, Any]] = []
@@ -649,6 +687,14 @@ class KubernetesService:
             job = self._batch.read_namespaced_job(job_name, namespace)
             phase = self._job_phase(job)
             if phase != last_phase:
+                self._emit_progress(
+                    progress_callback,
+                    "kubernetes_job_status",
+                    simulationId=simulation_id,
+                    jobName=job_name,
+                    namespace=namespace,
+                    phase=phase,
+                )
                 records.append(
                     self._observed_log_record(
                         simulation_id=simulation_id,
@@ -661,6 +707,13 @@ class KubernetesService:
                 last_phase = phase
             status = job.status
             if status.succeeded and status.succeeded >= 1:
+                self._emit_progress(
+                    progress_callback,
+                    "kubernetes_job_succeeded",
+                    simulationId=simulation_id,
+                    jobName=job_name,
+                    namespace=namespace,
+                )
                 records.append(
                     self._observed_log_record(
                         simulation_id=simulation_id,
@@ -671,6 +724,13 @@ class KubernetesService:
                 )
                 return records
             if status.failed and status.failed >= 1:
+                self._emit_progress(
+                    progress_callback,
+                    "kubernetes_job_failed",
+                    simulationId=simulation_id,
+                    jobName=job_name,
+                    namespace=namespace,
+                )
                 records.append(
                     self._observed_log_record(
                         simulation_id=simulation_id,
@@ -682,6 +742,13 @@ class KubernetesService:
                 )
                 raise KubernetesProvisioningError(f"Simulation job failed: {job_name}")
             time.sleep(1)
+        self._emit_progress(
+            progress_callback,
+            "kubernetes_job_timeout",
+            simulationId=simulation_id,
+            jobName=job_name,
+            namespace=namespace,
+        )
         records.append(
             self._observed_log_record(
                 simulation_id=simulation_id,
@@ -693,7 +760,13 @@ class KubernetesService:
         )
         raise KubernetesProvisioningError(f"Simulation job timed out: {job_name}")
 
-    def _read_job_observed_logs(self, namespace: str, job_name: str, simulation_id: str) -> list[dict[str, Any]]:
+    def _read_job_observed_logs(
+        self,
+        namespace: str,
+        job_name: str,
+        simulation_id: str,
+        progress_callback: ProgressCallback | None = None,
+    ) -> list[dict[str, Any]]:
         pods = self._core.list_namespaced_pod(
             namespace,
             label_selector=f"job-name={job_name}",
@@ -709,6 +782,14 @@ class KubernetesService:
                     raw={"pod": self._pod_snapshot(pod)},
                     target=pod_name,
                 )
+            )
+            self._emit_progress(
+                progress_callback,
+                "kubernetes_pod_observed",
+                simulationId=simulation_id,
+                jobName=job_name,
+                podName=pod_name,
+                namespace=namespace,
             )
             try:
                 logs = self._core.read_namespaced_pod_log(pod_name, namespace)
@@ -749,6 +830,15 @@ class KubernetesService:
                         "pod_name": pod_name,
                     }
                     records.append(record)
+                    self._emit_progress(
+                        progress_callback,
+                        "kubernetes_runner_log_observed",
+                        simulationId=simulation_id,
+                        jobName=job_name,
+                        podName=pod_name,
+                        target=record.get("target_service"),
+                        eventType=record.get("event_type"),
+                    )
                 else:
                     records.append(
                         self._observed_log_record(
@@ -758,6 +848,83 @@ class KubernetesService:
                             raw={"pod_name": pod_name, "record": record},
                             target=pod_name,
                         )
+                    )
+        return records
+
+    def _read_service_pod_logs(
+        self,
+        namespace: str,
+        services: list[dict[str, Any]],
+        simulation_id: str,
+        progress_callback: ProgressCallback | None = None,
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        since_seconds = max(300, self.settings.job_timeout_seconds * 2)
+        for service in services:
+            service_name = service["name"]
+            pods = self._pods_for_selector(namespace, f"pantheon.io/service={service_name}")
+            for pod in pods:
+                pod_name = pod.metadata.name
+                try:
+                    logs = self._core.read_namespaced_pod_log(pod_name, namespace, since_seconds=since_seconds)
+                except Exception as exc:  # pragma: no cover - depends on cluster client
+                    records.append(
+                        self._observed_log_record(
+                            simulation_id=simulation_id,
+                            job_name=f"{service_name}-service-log",
+                            event_type="kubernetes_service_log_unavailable",
+                            severity="Warning",
+                            raw={"pod_name": pod_name, "service_name": service_name, "error": str(exc)},
+                            target=service_name,
+                        )
+                    )
+                    continue
+                observed = 0
+                for line in logs.splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        records.append(
+                            self._observed_log_record(
+                                simulation_id=simulation_id,
+                                job_name=f"{service_name}-service-log",
+                                event_type="service_container_log_line",
+                                raw={"pod_name": pod_name, "service_name": service_name, "line": line},
+                                target=service_name,
+                            )
+                        )
+                        observed += 1
+                        continue
+                    if self._is_runner_log_record(record):
+                        raw_log = record.get("raw_log_json") if isinstance(record.get("raw_log_json"), dict) else {}
+                        record["raw_log_json"] = {
+                            **raw_log,
+                            "observed_source": "kubernetes_service_log",
+                            "pod_name": pod_name,
+                            "service_name": service_name,
+                        }
+                        records.append(record)
+                    else:
+                        records.append(
+                            self._observed_log_record(
+                                simulation_id=simulation_id,
+                                job_name=f"{service_name}-service-log",
+                                event_type="service_container_json_log_line",
+                                raw={"pod_name": pod_name, "service_name": service_name, "record": record},
+                                target=service_name,
+                            )
+                        )
+                    observed += 1
+                if observed:
+                    self._emit_progress(
+                        progress_callback,
+                        "kubernetes_service_logs_collected",
+                        simulationId=simulation_id,
+                        serviceName=service_name,
+                        podName=pod_name,
+                        eventCount=observed,
                     )
         return records
 
@@ -905,6 +1072,17 @@ class KubernetesService:
 
     def _now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _emit_progress(self, callback: ProgressCallback | None, event_type: str, **payload: Any) -> None:
+        if not callback:
+            return
+        callback(
+            {
+                "type": event_type,
+                "timestamp": self._now_iso(),
+                **payload,
+            }
+        )
 
     def _delete_job(self, namespace: str, job_name: str) -> None:
         from kubernetes.client import ApiException

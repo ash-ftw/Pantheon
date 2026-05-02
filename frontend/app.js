@@ -11,6 +11,8 @@ const state = {
   report: null,
   kubernetesStatus: null,
   kubernetesPolling: false,
+  simulationEvents: [],
+  simulationStreaming: false,
   loading: true,
   message: "",
   error: ""
@@ -86,6 +88,86 @@ function startKubernetesPolling(labId) {
     });
   }, 5000);
   render();
+}
+
+function simulationStreamUrl(labId, scenarioId) {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const params = new URLSearchParams({ token: state.token, scenario_id: scenarioId });
+  return `${protocol}//${window.location.host}/api/labs/${encodeURIComponent(labId)}/simulations/stream?${params}`;
+}
+
+function canUseSimulationWebSocket() {
+  return Boolean(window.WebSocket && state.token && window.location.port !== "8090");
+}
+
+async function runSimulationWithProgress(lab, scenarioId) {
+  state.simulationEvents = [];
+  state.simulationStreaming = true;
+  state.message = "Simulation stream started.";
+  state.error = "";
+  state.report = null;
+  render();
+
+  if (!canUseSimulationWebSocket()) {
+    return runSimulationRest(lab, scenarioId, "Simulation completed with normalized logs and AI classification.");
+  }
+
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(simulationStreamUrl(lab.id, scenarioId));
+    let completed = false;
+    let fallbackStarted = false;
+    socket.onmessage = async (event) => {
+      const payload = JSON.parse(event.data);
+      if (payload.type === "simulation_completed") {
+        completed = true;
+        await loadDashboard();
+        state.simulation = payload.simulation;
+        state.simulationStreaming = false;
+        state.message = "Simulation completed through WebSocket progress stream.";
+        render();
+        resolve(payload.simulation);
+        return;
+      }
+      if (payload.type === "simulation_error") {
+        completed = true;
+        state.simulationStreaming = false;
+        render();
+        reject(new Error(payload.detail || "Simulation stream failed"));
+        return;
+      }
+      state.simulationEvents = [...state.simulationEvents.slice(-23), payload];
+      render();
+    };
+    socket.onerror = () => {
+      if (!completed && !fallbackStarted) {
+        fallbackStarted = true;
+        socket.close();
+        runSimulationRest(lab, scenarioId, "Simulation completed through REST fallback.")
+          .then(resolve)
+          .catch(reject);
+      }
+    };
+    socket.onclose = () => {
+      if (!completed && !fallbackStarted && state.simulationStreaming) {
+        state.simulationStreaming = false;
+        render();
+      }
+    };
+  });
+}
+
+async function runSimulationRest(lab, scenarioId, message) {
+  const result = await api(`/api/labs/${lab.id}/simulations`, {
+    method: "POST",
+    body: JSON.stringify({ scenario_id: scenarioId })
+  });
+  await loadDashboard();
+  state.simulation = result.simulation;
+  state.simulationStreaming = false;
+  state.report = null;
+  state.message = message;
+  render();
+  return result.simulation;
 }
 
 async function boot() {
@@ -236,6 +318,7 @@ function renderDashboard() {
           ${lab ? renderKubernetesStatus(lab) : ""}
           ${lab ? renderTargetApps(lab) : ""}
           ${lab ? renderScenarios(lab) : ""}
+          ${renderSimulationProgress()}
           ${simulation ? renderSimulation(simulation) : ""}
           ${state.report ? renderReport(state.report) : ""}
         </section>
@@ -646,6 +729,51 @@ function renderScenarios(lab) {
 }
 
 
+function renderSimulationProgress() {
+  if (!state.simulationStreaming && !state.simulationEvents.length) return "";
+  const events = state.simulationEvents.slice(-8).reverse();
+  return `
+    <section class="panel progress-panel">
+      <div class="panel-header">
+        <div>
+          <h2>Live Simulation Progress</h2>
+          <p>${state.simulationStreaming ? "Streaming backend progress over WebSocket." : "Last streamed simulation events."}</p>
+        </div>
+        <span class="badge ${state.simulationStreaming ? "green" : "blue"}">${state.simulationStreaming ? "streaming" : "complete"}</span>
+      </div>
+      <div class="progress-list">
+        ${events
+          .map(
+            (event) => `
+              <div class="progress-event">
+                <span class="progress-dot"></span>
+                <div>
+                  <strong>${escapeHtml(progressLabel(event.type))}</strong>
+                  <p>${escapeHtml(progressDetail(event))}</p>
+                </div>
+                <small>${event.timestamp ? escapeHtml(new Date(event.timestamp).toLocaleTimeString()) : ""}</small>
+              </div>
+            `
+          )
+          .join("") || `<div class="empty">Waiting for stream events.</div>`}
+      </div>
+    </section>
+  `;
+}
+
+function progressLabel(type) {
+  return String(type || "progress").replaceAll("_", " ");
+}
+
+function progressDetail(event) {
+  if (event.target) return `${event.source || event.jobName || "runner"} -> ${event.target} ${event.endpoint || ""}`.trim();
+  if (event.jobName && event.phase) return `${event.jobName} is ${event.phase}`;
+  if (event.serviceName) return `${event.serviceName}: ${event.eventCount || 0} container log event(s)`;
+  if (event.eventCount !== undefined) return `${event.eventCount} event(s)`;
+  if (event.riskLevel) return `risk ${event.riskLevel}`;
+  return event.scenarioName || event.scenarioId || event.simulationId || "";
+}
+
 function renderSimulation(simulation) {
   const observedLogs = (simulation.logs || []).filter((log) => {
     const raw = log.rawLogJson || {};
@@ -792,8 +920,12 @@ function renderLogs(logs) {
   const rows = logs
     .slice(-12)
     .reverse()
-    .map(
-      (log) => `
+    .map((log) => {
+      const raw = log.rawLogJson || {};
+      const observedSource = raw.observed_source || raw.observedSource || "generated";
+      const latency = raw.latency_ms ?? raw.latencyMs;
+      const routeFamily = raw.route_family || raw.routeFamily || "";
+      return `
         <tr>
           <td>${escapeHtml(new Date(log.timestamp).toLocaleTimeString())}</td>
           <td>${escapeHtml(log.sourceService)} -> ${escapeHtml(log.targetService)}</td>
@@ -801,9 +933,11 @@ function renderLogs(logs) {
           <td>${escapeHtml(log.eventType)}</td>
           <td>${escapeHtml(log.statusCode)}</td>
           <td>${log.isAttackSimulation ? `<span class="badge amber">attack</span>` : `<span class="badge green">normal</span>`}</td>
+          <td><span class="badge ${observedSource.includes("service") ? "cyan" : observedSource === "generated" ? "blue" : "green"}">${escapeHtml(observedSource)}</span></td>
+          <td>${routeFamily ? `<span class="badge">${escapeHtml(routeFamily)}</span>` : ""}${latency !== undefined ? `<span class="badge cyan">${escapeHtml(latency)} ms</span>` : ""}</td>
         </tr>
-      `
-    )
+      `;
+    })
     .join("");
   return `
     <section style="margin-top:16px">
@@ -823,6 +957,8 @@ function renderLogs(logs) {
               <th>Event</th>
               <th>Status</th>
               <th>Label</th>
+              <th>Observed From</th>
+              <th>Access Detail</th>
             </tr>
           </thead>
           <tbody>${rows}</tbody>
@@ -1006,6 +1142,8 @@ app.addEventListener("click", async (event) => {
       state.simulation = null;
       state.report = null;
       state.kubernetesStatus = null;
+      state.simulationEvents = [];
+      state.simulationStreaming = false;
       render();
     }
     if (action === "refresh") {
@@ -1020,6 +1158,8 @@ app.addEventListener("click", async (event) => {
       state.simulation = null;
       state.report = null;
       state.kubernetesStatus = null;
+      state.simulationEvents = [];
+      state.simulationStreaming = false;
       render();
     }
     if (action === "start-lab" || action === "stop-lab") {
@@ -1038,6 +1178,8 @@ app.addEventListener("click", async (event) => {
       state.message = "Lab deleted.";
       state.simulation = null;
       state.report = null;
+      state.simulationEvents = [];
+      state.simulationStreaming = false;
       render();
     }
     if (action === "select-scenario") {
@@ -1059,29 +1201,13 @@ app.addEventListener("click", async (event) => {
     if (action === "run-simulation") {
       const lab = selectedLab();
       if (!lab) return;
-      const result = await api(`/api/labs/${lab.id}/simulations`, {
-        method: "POST",
-        body: JSON.stringify({ scenario_id: state.selectedScenarioId })
-      });
-      await loadDashboard();
-      state.simulation = result.simulation;
-      state.report = null;
-      state.message = "Simulation completed with normalized logs and AI classification.";
-      render();
+      await runSimulationWithProgress(lab, state.selectedScenarioId);
     }
     if (action === "rerun-simulation") {
       const lab = selectedLab();
       if (!lab) return;
       const scenarioId = target.dataset.scenarioId || state.selectedScenarioId;
-      const result = await api(`/api/labs/${lab.id}/simulations`, {
-        method: "POST",
-        body: JSON.stringify({ scenario_id: scenarioId })
-      });
-      await loadDashboard();
-      state.simulation = result.simulation;
-      state.report = null;
-      state.message = "Scenario rerun completed.";
-      render();
+      await runSimulationWithProgress(lab, scenarioId);
     }
     if (action === "apply-defense") {
       const lab = selectedLab();

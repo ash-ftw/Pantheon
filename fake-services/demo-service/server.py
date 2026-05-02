@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import socket
 import time
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -13,6 +16,7 @@ SERVICE_TYPE = os.getenv("SERVICE_TYPE", "api")
 PORT = int(os.getenv("PORT", "8080"))
 INPUT_VALIDATION = os.getenv("PANTHEON_INPUT_VALIDATION", "false").lower() == "true"
 ADMIN_RESTRICTED = os.getenv("PANTHEON_ADMIN_RESTRICTED", "false").lower() == "true"
+CONTAINER_NAME = os.getenv("HOSTNAME", socket.gethostname())
 
 
 def emit(event: dict) -> None:
@@ -30,6 +34,19 @@ def emit(event: dict) -> None:
         "is_attack_simulation": event.get("is_attack_simulation", False),
         "raw_log_json": {
             "service_type": SERVICE_TYPE,
+            "container": {
+                "hostname": CONTAINER_NAME,
+                "port": PORT,
+            },
+            "request_id": event.get("request_id"),
+            "route_family": event.get("route_family"),
+            "latency_ms": event.get("latency_ms"),
+            "request": event.get("request", {}),
+            "response": event.get("response", {}),
+            "defense_state": {
+                "input_validation": INPUT_VALIDATION,
+                "admin_restricted": ADMIN_RESTRICTED,
+            },
             "user_agent": event.get("user_agent", ""),
             "safe_simulation": True,
         },
@@ -53,6 +70,8 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def _handle(self) -> None:
+        self.request_started_at = time.perf_counter()
+        self.request_id = self.headers.get("X-Pantheon-Request-Id") or uuid.uuid4().hex[:12]
         parsed = urlparse(self.path)
         endpoint = parsed.path
         source = self.headers.get("X-Pantheon-Source", "traffic-generator")
@@ -127,6 +146,8 @@ class Handler(BaseHTTPRequestHandler):
         is_attack: bool,
         data: dict | None = None,
     ) -> None:
+        response_payload = {"service": SERVICE_NAME, "event_type": event_type, "data": data or {}}
+        response_bytes = len(json.dumps(response_payload).encode("utf-8"))
         emit(
             {
                 "source_service": source,
@@ -137,10 +158,18 @@ class Handler(BaseHTTPRequestHandler):
                 "event_type": event_type,
                 "severity": severity,
                 "is_attack_simulation": is_attack,
+                "request_id": getattr(self, "request_id", ""),
+                "route_family": self._route_family(endpoint),
+                "latency_ms": round((time.perf_counter() - getattr(self, "request_started_at", time.perf_counter())) * 1000, 2),
+                "request": self._request_context(endpoint),
+                "response": {
+                    "bytes": response_bytes,
+                    "status_text": status.phrase,
+                },
                 "user_agent": self.headers.get("User-Agent", ""),
             }
         )
-        self._respond(status, {"service": SERVICE_NAME, "event_type": event_type, "data": data or {}})
+        self._respond(status, response_payload)
 
     def _respond(self, status: HTTPStatus, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -154,7 +183,10 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0") or "0")
         if length <= 0:
             return ""
-        return self.rfile.read(min(length, 8192)).decode("utf-8", errors="replace")
+        body = self.rfile.read(min(length, 8192)).decode("utf-8", errors="replace")
+        self.request_body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest() if body else ""
+        self.request_body_bytes = len(body.encode("utf-8"))
+        return body
 
     def _body_field(self, body: str, key: str, default: str) -> str:
         if not body:
@@ -165,6 +197,43 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             parsed = parse_qs(body)
             return parsed.get(key, [default])[0]
+
+    def _request_context(self, endpoint: str) -> dict:
+        parsed = urlparse(self.path)
+        safe_headers = {
+            "user_agent": self.headers.get("User-Agent", ""),
+            "content_type": self.headers.get("Content-Type", ""),
+            "accept": self.headers.get("Accept", ""),
+            "pantheon_source": self.headers.get("X-Pantheon-Source", ""),
+            "pantheon_payload": self.headers.get("X-Pantheon-Payload", ""),
+            "pantheon_attack": self.headers.get("X-Pantheon-Attack", ""),
+            "pantheon_trusted": self.headers.get("X-Pantheon-Trusted", ""),
+        }
+        remote_ip = self.client_address[0] if self.client_address else ""
+        return {
+            "id": getattr(self, "request_id", ""),
+            "path": endpoint,
+            "query_keys": sorted(parse_qs(parsed.query).keys()),
+            "query_length": len(parsed.query),
+            "content_length": int(self.headers.get("Content-Length", "0") or "0"),
+            "body_bytes_read": getattr(self, "request_body_bytes", 0),
+            "body_sha256": getattr(self, "request_body_sha256", ""),
+            "headers": safe_headers,
+            "remote_addr_hash": hashlib.sha256(remote_ip.encode("utf-8")).hexdigest()[:12] if remote_ip else "",
+        }
+
+    def _route_family(self, endpoint: str) -> str:
+        if endpoint == "/health":
+            return "health"
+        if endpoint == "/login":
+            return "authentication"
+        if endpoint in {"/search", "/employees", "/products", "/marks"}:
+            return "business-api"
+        if endpoint.startswith("/admin"):
+            return "admin-api"
+        if endpoint.startswith("/db") or SERVICE_TYPE in {"database", "cache"}:
+            return "datastore"
+        return "generic"
 
 
 def main() -> None:

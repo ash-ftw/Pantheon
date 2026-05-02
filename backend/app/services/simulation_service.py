@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy.orm import Session
 
@@ -20,6 +20,8 @@ from app.models import (
     uuid_str,
 )
 from app.services.kubernetes_service import KubernetesService
+
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 def active_defense_actions(db: Session, lab_id: str) -> list[DefenseAction]:
@@ -75,7 +77,12 @@ def normal_traffic_for_lab(lab: Lab) -> list[str]:
     return traffic
 
 
-def run_simulation(db: Session, lab: Lab, scenario: AttackScenario) -> SimulationRun:
+def run_simulation(
+    db: Session,
+    lab: Lab,
+    scenario: AttackScenario,
+    progress_callback: ProgressCallback | None = None,
+) -> SimulationRun:
     template = lab.template
     config = scenario.scenario_config_json
     service_definitions = service_definitions_for_lab(lab)
@@ -91,6 +98,22 @@ def run_simulation(db: Session, lab: Lab, scenario: AttackScenario) -> Simulatio
     suspicious_event_count = 0
     blocked = False
     blocked_at = None
+    _emit_progress(
+        progress_callback,
+        "simulation_started",
+        simulationId=simulation_id,
+        labId=lab.id,
+        scenarioId=scenario.id,
+        scenarioName=scenario.scenario_name,
+        mode=settings.kubernetes_mode,
+    )
+    _emit_progress(
+        progress_callback,
+        "normal_traffic_generated",
+        simulationId=simulation_id,
+        eventCount=len(generated_logs),
+        pathCount=len(normal_traffic),
+    )
 
     for raw_step in normalized_config.get("steps", []):
         step = {
@@ -98,6 +121,16 @@ def run_simulation(db: Session, lab: Lab, scenario: AttackScenario) -> Simulatio
             "source": raw_step.get("source", ""),
             "target": raw_step.get("target", ""),
         }
+        _emit_progress(
+            progress_callback,
+            "attack_step_started",
+            simulationId=simulation_id,
+            source=step["source"],
+            target=step["target"],
+            method=step["method"],
+            endpoint=step["endpoint"],
+            payloadCategory=step["payload_category"],
+        )
         should_block = _defense_blocks_step(scenario.attack_type, step, active_action_types)
         event_count = max(1, int(step["count"] * 0.35)) if should_block else int(step["count"])
         normalized_step = {**step, "count": event_count, "blocked": should_block}
@@ -130,9 +163,29 @@ def run_simulation(db: Session, lab: Lab, scenario: AttackScenario) -> Simulatio
         if should_block:
             blocked = True
             blocked_at = step["target"]
+            _emit_progress(
+                progress_callback,
+                "attack_step_blocked",
+                simulationId=simulation_id,
+                target=blocked_at,
+                eventCount=event_count,
+            )
             break
+        _emit_progress(
+            progress_callback,
+            "attack_step_completed",
+            simulationId=simulation_id,
+            target=step["target"],
+            eventCount=event_count,
+        )
 
     if settings.kubernetes_mode == "real":
+        _emit_progress(
+            progress_callback,
+            "kubernetes_jobs_started",
+            simulationId=simulation_id,
+            namespace=lab.namespace,
+        )
         generated_logs = [
             _coerce_job_log_record(item, started_at)
             for item in KubernetesService().run_simulation_jobs(
@@ -141,8 +194,15 @@ def run_simulation(db: Session, lab: Lab, scenario: AttackScenario) -> Simulatio
                 services=service_definitions,
                 scenario_config=normalized_config,
                 normal_traffic=normal_traffic,
+                progress_callback=progress_callback,
             )
         ]
+        _emit_progress(
+            progress_callback,
+            "kubernetes_logs_collected",
+            simulationId=simulation_id,
+            eventCount=len(generated_logs),
+        )
         attack_logs = [
             item
             for item in generated_logs
@@ -178,6 +238,13 @@ def run_simulation(db: Session, lab: Lab, scenario: AttackScenario) -> Simulatio
 
     attack_path = _create_attack_path(service_definitions, path_steps, blocked_at)
     risk_level = _risk_after_defense(config.get("default_risk", "Medium"), blocked)
+    _emit_progress(
+        progress_callback,
+        "analysis_started",
+        simulationId=simulation_id,
+        suspiciousEventCount=suspicious_event_count,
+        reachedServices=reached_services,
+    )
     analysis = _analyze_simulation(scenario.attack_type, risk_level, reached_services, blocked, suspicious_event_count)
     comparison = (
         _build_comparison(db, lab.id, scenario.id, reached_services, risk_level, suspicious_event_count, blocked)
@@ -213,6 +280,14 @@ def run_simulation(db: Session, lab: Lab, scenario: AttackScenario) -> Simulatio
         simulation.comparison_json["postDefenseSimulationId"] = simulation.id
     db.add(simulation)
     db.flush()
+    _emit_progress(
+        progress_callback,
+        "simulation_record_created",
+        simulationId=simulation.id,
+        riskLevel=risk_level,
+        blocked=blocked,
+        blockedAt=blocked_at,
+    )
 
     for log in generated_logs:
         db.add(
@@ -238,7 +313,26 @@ def run_simulation(db: Session, lab: Lab, scenario: AttackScenario) -> Simulatio
         db.add(DefenseRecommendation(**recommendation))
 
     db.commit()
+    _emit_progress(
+        progress_callback,
+        "simulation_persisted",
+        simulationId=simulation.id,
+        logCount=len(generated_logs),
+        riskLevel=risk_level,
+    )
     return simulation
+
+
+def _emit_progress(callback: ProgressCallback | None, event_type: str, **payload: Any) -> None:
+    if not callback:
+        return
+    callback(
+        {
+            "type": event_type,
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            **payload,
+        }
+    )
 
 
 def create_report(db: Session, simulation: SimulationRun) -> Report:

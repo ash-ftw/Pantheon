@@ -80,6 +80,29 @@ def test_observed_kubernetes_log_record_is_normalized() -> None:
     assert normalized["timestamp"].tzinfo is not None
 
 
+def test_websocket_simulation_stream_returns_progress_and_result() -> None:
+    with TestClient(app) as client:
+        headers = auth_headers(client)
+        token = headers["Authorization"].split(" ", 1)[1]
+        lab = create_lab(client, headers)
+        events = []
+
+        with client.websocket_connect(
+            f"/api/labs/{lab['id']}/simulations/stream?token={token}&scenario_id=brute-force-login"
+        ) as websocket:
+            while True:
+                event = websocket.receive_json()
+                events.append(event)
+                if event["type"] == "simulation_completed":
+                    break
+
+        assert any(event["type"] == "simulation_started" for event in events)
+        assert any(event["type"] == "attack_step_completed" for event in events)
+        completed = events[-1]
+        assert completed["simulation"]["scenarioId"] == "brute-force-login"
+        assert completed["simulation"]["logs"]
+
+
 def test_byo_target_custom_scenario_simulation_and_report() -> None:
     with TestClient(app) as client:
         headers = auth_headers(client)

@@ -19,6 +19,8 @@ Pantheon is a safe cyber-range project for learning Kubernetes attack paths and 
 - Dashboard report generation
 - Live Kubernetes pod/job status polling for lab services
 - Observed Kubernetes job/pod lifecycle logs in real mode
+- WebSocket simulation progress streaming in the FastAPI backend
+- Deeper fake-service container access logs with request metadata, route family, latency, response size, and defense state
 
 Attack behavior is constrained to preset or custom safe scenarios inside the selected lab. In dry-run mode, Pantheon still uses generated logs and path data. In real Kubernetes mode, traffic and attack runners execute as Kubernetes Jobs and Pantheon records observed job, pod, and container-log events. The MVP does not attack real hosts, external IPs, domains, or local services outside the lab namespace.
 
@@ -130,7 +132,52 @@ docker compose run --rm --no-deps `
   api pytest -q
 ```
 
-Current tests cover the BYO web-app target workflow, custom scenario execution, report target inclusion, external target rejection, duplicate service-name rejection, dry-run Kubernetes readiness polling, and observed Kubernetes log normalization.
+Current tests cover the BYO web-app target workflow, custom scenario execution, WebSocket simulation progress, report target inclusion, external target rejection, duplicate service-name rejection, dry-run Kubernetes readiness polling, and observed Kubernetes log normalization.
+
+## CI and Kind Integration
+
+The `webapp` branch includes GitHub Actions checks for:
+
+- FastAPI regression tests in dry-run mode
+- API image builds
+- fake-service and runner image builds
+- a Kind-backed integration test that creates a real lab namespace, waits for pod readiness, runs Kubernetes Job-based traffic/attack runners, and verifies observed Kubernetes logs
+
+The Kind test is opt-in outside CI:
+
+```powershell
+cd "D:\Pantheon"
+$env:PANTHEON_RUN_KIND_TESTS="true"
+$env:KUBERNETES_MODE="real"
+$env:KUBERNETES_SERVICE_IMAGE="pantheon-fake-service:latest"
+$env:KUBERNETES_RUNNER_IMAGE="pantheon-runner:latest"
+$env:KUBERNETES_RUNNER_IMAGE_PULL_POLICY="IfNotPresent"
+C:\Python314\python.exe -m pytest backend\tests\test_kind_integration.py -q
+```
+
+## WebSocket Simulation Progress
+
+The FastAPI backend exposes:
+
+```text
+WS /api/labs/{lab_id}/simulations/stream?token={token}&scenario_id={scenario_id}
+```
+
+The dashboard uses this stream when served by the FastAPI backend. The dependency-free Node demo keeps the existing REST simulation path as a fallback.
+
+Stream events include simulation start, normal traffic generation, attack step start/completion, Kubernetes Job status changes, runner log observation, service container log collection, analysis, persistence, and the final simulation result.
+
+## Fake-Service vs Real-Service Containers
+
+Pantheon uses fake-service containers for built-in organization templates because they are safe, deterministic, lightweight, and academically repeatable. They make it possible to demonstrate attack paths, defenses, Kubernetes isolation, and AI classification without shipping intentionally vulnerable real business apps.
+
+Pantheon also supports real user-provided app containers through the BYO Web App Targets workflow. A user can attach a Docker image or constrained Kubernetes YAML, and Pantheon deploys that app inside the lab namespace. Simulations still remain internal-only and cannot target external domains or IPs.
+
+Recommended split:
+
+- Use fake-service containers for default repeatable labs and evaluator demos.
+- Use real-service containers for user-owned apps that need custom testing inside a contained namespace.
+- Keep attack runners constrained to internal Kubernetes services in both cases.
 
 ## Bring Your Own Web App Targets
 
@@ -186,8 +233,7 @@ pantheon/
 
 ## Next Engineering Step
 
-The production backend path now covers the full demo workflow: auth, templates, scenarios, labs, simulations, logs, AI analysis, defenses, comparisons, reports, dashboard serving, fake service containers, Kubernetes Job-based traffic/attack runners, live pod/job status polling, observed Kubernetes lifecycle logs, Alembic migration scaffolding, and initial API tests. The next implementation steps are:
+The production backend path now covers the full demo workflow: auth, templates, scenarios, labs, simulations, logs, AI analysis, defenses, comparisons, reports, dashboard serving, fake service containers, Kubernetes Job-based traffic/attack runners, live pod/job status polling, WebSocket simulation progress, observed Kubernetes lifecycle logs, deeper service access logs, Alembic migration scaffolding, API tests, CI image builds, and Kind integration coverage. The next implementation steps are:
 
-- add CI image builds and Kind integration tests
-- stream simulation progress over WebSockets or server-sent events
-- add deeper service access logs from fake-service containers
+- add a full in-dashboard service-log detail drawer
+- add CI publishing for versioned local images

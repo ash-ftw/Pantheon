@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import asyncio
+from queue import Empty, Queue
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session, joinedload
 
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.dependencies import can_access_lab, get_current_user
 from app.models import AIAnalysis, AttackScenario, DefenseRecommendation, Lab, SimulationRun, User
 from app.schemas import SimulationCreate
+from app.security import decode_access_token
 from app.services.presenters import analysis_to_api, log_to_api, recommendation_to_api, simulation_to_api
 from app.services.simulation_service import run_simulation, service_definitions_for_lab
 
@@ -84,6 +90,73 @@ def create_simulation(
     if not loaded:
         raise HTTPException(status_code=500, detail="Simulation was created but could not be loaded")
     return {"simulation": simulation_to_api(loaded)}
+
+
+@router.websocket("/labs/{lab_id}/simulations/stream")
+async def stream_simulation(websocket: WebSocket, lab_id: str) -> None:
+    await websocket.accept()
+    token = websocket.query_params.get("token", "")
+    scenario_id = websocket.query_params.get("scenario_id") or websocket.query_params.get("scenarioId")
+    if not token or not scenario_id:
+        await websocket.send_json({"type": "simulation_error", "detail": "token and scenario_id are required"})
+        await websocket.close(code=1008)
+        return
+
+    events: Queue[dict[str, Any]] = Queue()
+    task = asyncio.create_task(asyncio.to_thread(_run_streamed_simulation, lab_id, scenario_id, token, events))
+    try:
+        while True:
+            while True:
+                try:
+                    await websocket.send_json(jsonable_encoder(events.get_nowait()))
+                except Empty:
+                    break
+            if task.done():
+                break
+            await asyncio.sleep(0.1)
+        simulation = await task
+        while True:
+            try:
+                await websocket.send_json(jsonable_encoder(events.get_nowait()))
+            except Empty:
+                break
+        await websocket.send_json(jsonable_encoder({"type": "simulation_completed", "simulation": simulation}))
+        await websocket.close(code=1000)
+    except WebSocketDisconnect:
+        return
+    except Exception as exc:
+        await websocket.send_json({"type": "simulation_error", "detail": str(exc)})
+        await websocket.close(code=1011)
+
+
+def _run_streamed_simulation(
+    lab_id: str,
+    scenario_id: str,
+    token: str,
+    events: Queue[dict[str, Any]],
+) -> dict:
+    user_id = decode_access_token(token)
+    if not user_id:
+        raise ValueError("Invalid or expired token")
+    with SessionLocal() as db:
+        user = db.get(User, user_id)
+        if not user:
+            raise ValueError("User not found")
+        lab = _load_lab(db, lab_id)
+        if not lab or not can_access_lab(user, lab.user_id):
+            raise ValueError("Lab not found")
+        if lab.status != "Running":
+            raise ValueError("Lab must be running before simulation")
+        scenario = db.get(AttackScenario, scenario_id)
+        if not scenario:
+            raise ValueError("Unknown scenario")
+        _validate_scenario_for_lab(lab, scenario)
+        events.put({"type": "simulation_stream_connected", "labId": lab.id, "scenarioId": scenario.id})
+        simulation = run_simulation(db, lab, scenario, progress_callback=events.put)
+        loaded = _load_simulation(db, simulation.id)
+        if not loaded:
+            raise ValueError("Simulation was created but could not be loaded")
+        return simulation_to_api(loaded)
 
 
 @router.get("/simulations/{simulation_id}")

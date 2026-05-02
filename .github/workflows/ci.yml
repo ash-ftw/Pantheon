@@ -1,0 +1,81 @@
+name: Pantheon CI
+
+on:
+  push:
+    branches:
+      - main
+      - webapp
+      - mark3
+  pull_request:
+    branches:
+      - main
+      - webapp
+      - mark3
+
+jobs:
+  backend-tests:
+    name: Backend Regression Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build API image
+        run: docker compose build api
+
+      - name: Run API tests in dry-run mode
+        run: |
+          docker compose run --rm --no-deps \
+            -e KUBERNETES_MODE=dry-run \
+            -e PANTHEON_AUTO_CREATE_TABLES=true \
+            api pytest -q
+
+  image-builds:
+    name: Container Image Builds
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build lab service and runner images
+        run: docker compose --profile images build fake-service-image runner-image
+
+  kind-integration:
+    name: Kind Integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build lab images
+        run: docker compose --profile images build fake-service-image runner-image
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: pantheon-ci
+          node_image: kindest/node:v1.30.0
+          wait: 120s
+
+      - name: Load lab images into Kind
+        run: |
+          kind load docker-image pantheon-fake-service:latest --name pantheon-ci
+          kind load docker-image pantheon-runner:latest --name pantheon-ci
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install backend dependencies
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: Run real Kubernetes integration test
+        env:
+          PANTHEON_RUN_KIND_TESTS: "true"
+          KUBERNETES_MODE: real
+          KUBERNETES_SERVICE_IMAGE: pantheon-fake-service:latest
+          KUBERNETES_RUNNER_IMAGE: pantheon-runner:latest
+          KUBERNETES_RUNNER_IMAGE_PULL_POLICY: IfNotPresent
+          KUBERNETES_JOB_TIMEOUT_SECONDS: "90"
+        run: python -m pytest backend/tests/test_kind_integration.py -q
