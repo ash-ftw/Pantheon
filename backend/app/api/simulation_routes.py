@@ -10,11 +10,12 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.database import SessionLocal, get_db
 from app.dependencies import can_access_lab, get_current_user
-from app.models import AIAnalysis, AttackScenario, DefenseRecommendation, Lab, SimulationRun, User
+from app.models import AIAnalysis, AttackScenario, DefenseRecommendation, Lab, SimulationJob, SimulationRun, User, utcnow
 from app.schemas import SimulationCreate
 from app.security import decode_access_token
-from app.services.presenters import analysis_to_api, log_to_api, recommendation_to_api, simulation_to_api
-from app.services.simulation_service import run_simulation, service_definitions_for_lab
+from app.services.kubernetes_service import KubernetesService, KubernetesProvisioningError
+from app.services.presenters import analysis_to_api, log_to_api, recommendation_to_api, simulation_job_to_api, simulation_to_api
+from app.services.simulation_service import mark_simulation_jobs_cancelled, run_simulation, service_definitions_for_lab
 
 router = APIRouter(tags=["simulations"])
 
@@ -40,6 +41,7 @@ def _load_simulation(db: Session, simulation_id: str) -> SimulationRun | None:
             joinedload(SimulationRun.lab).joinedload(Lab.template),
             joinedload(SimulationRun.scenario),
             joinedload(SimulationRun.logs),
+            joinedload(SimulationRun.jobs),
             joinedload(SimulationRun.ai_analysis),
             joinedload(SimulationRun.recommendations),
             joinedload(SimulationRun.report),
@@ -180,10 +182,43 @@ def stop_simulation(
     simulation = _load_simulation(db, simulation_id)
     if not simulation or not can_access_lab(user, simulation.lab.user_id):
         raise HTTPException(status_code=404, detail="Simulation not found")
+    if simulation.status in {"Completed", "Failed", "Stopped"}:
+        return {"simulation": simulation_to_api(simulation)}
+    simulation.status = "Stopping"
+    simulation.completed_at = utcnow()
+    simulation.result_summary = "Simulation cancellation requested. Active Kubernetes jobs are being stopped."
+    try:
+        KubernetesService().cancel_simulation_jobs(simulation.lab.namespace, simulation.id)
+    except KubernetesProvisioningError as exc:
+        simulation.status = "Failed"
+        simulation.result_summary = f"Simulation cancellation failed: {exc}"
+        db.commit()
+        loaded = _load_simulation(db, simulation_id)
+        return {"simulation": simulation_to_api(loaded)}
+    mark_simulation_jobs_cancelled(db, simulation.id)
     simulation.status = "Stopped"
+    simulation.result_summary = "Simulation was stopped and active Kubernetes jobs were cancelled."
     db.commit()
     loaded = _load_simulation(db, simulation_id)
     return {"simulation": simulation_to_api(loaded)}
+
+
+@router.get("/simulations/{simulation_id}/jobs")
+def get_simulation_jobs(
+    simulation_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    simulation = _load_simulation(db, simulation_id)
+    if not simulation or not can_access_lab(user, simulation.lab.user_id):
+        raise HTTPException(status_code=404, detail="Simulation not found")
+    jobs = (
+        db.query(SimulationJob)
+        .filter(SimulationJob.simulation_id == simulation.id)
+        .order_by(SimulationJob.created_at)
+        .all()
+    )
+    return {"jobs": [simulation_job_to_api(item) for item in jobs]}
 
 
 @router.get("/simulations/{simulation_id}/logs")

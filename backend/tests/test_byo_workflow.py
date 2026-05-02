@@ -15,7 +15,9 @@ os.environ["PANTHEON_AUTO_CREATE_TABLES"] = "true"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app.database import SessionLocal  # noqa: E402
 from app.main import app  # noqa: E402
+from app.models import AttackScenario, SimulationJob, SimulationRun, utcnow, uuid_str  # noqa: E402
 from app.services.simulation_service import _coerce_job_log_record  # noqa: E402
 
 
@@ -101,6 +103,55 @@ def test_websocket_simulation_stream_returns_progress_and_result() -> None:
         completed = events[-1]
         assert completed["simulation"]["scenarioId"] == "brute-force-login"
         assert completed["simulation"]["logs"]
+
+
+def test_stop_running_simulation_cancels_active_jobs() -> None:
+    with TestClient(app) as client:
+        headers = auth_headers(client)
+        lab = create_lab(client, headers)
+        simulation_id = uuid_str()
+        job_id = uuid_str()
+        with SessionLocal() as db:
+            scenario = db.get(AttackScenario, "brute-force-login")
+            simulation = SimulationRun(
+                id=simulation_id,
+                lab_id=lab["id"],
+                scenario_id=scenario.id,
+                scenario_name=scenario.scenario_name,
+                attack_type=scenario.attack_type,
+                status="Running",
+                started_at=utcnow(),
+                risk_level="Unknown",
+                result_summary="Simulation is running.",
+                blocked=False,
+                reached_services_json=[],
+                suspicious_event_count=0,
+                applied_defenses_json=[],
+                attack_path_json={"nodes": [], "edges": []},
+            )
+            job = SimulationJob(
+                id=job_id,
+                simulation_id=simulation_id,
+                lab_id=lab["id"],
+                namespace=lab["namespace"],
+                job_name="pantheon-attack-test",
+                job_type="attack",
+                status="Running",
+                details_json={},
+            )
+            db.add_all([simulation, job])
+            db.commit()
+
+        response = client.post(f"/api/simulations/{simulation_id}/stop", headers=headers)
+
+        assert response.status_code == 200, response.text
+        stopped = response.json()["simulation"]
+        assert stopped["status"] == "Stopped"
+        assert stopped["jobs"][0]["status"] == "Cancelled"
+
+        jobs_response = client.get(f"/api/simulations/{simulation_id}/jobs", headers=headers)
+        assert jobs_response.status_code == 200
+        assert jobs_response.json()["jobs"][0]["status"] == "Cancelled"
 
 
 def test_byo_target_custom_scenario_simulation_and_report() -> None:

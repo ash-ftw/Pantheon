@@ -169,7 +169,31 @@ class SimulationRun(Base):
         cascade="all, delete-orphan",
         order_by="DefenseRecommendation.priority",
     )
+    jobs: Mapped[list["SimulationJob"]] = relationship(
+        back_populates="simulation",
+        cascade="all, delete-orphan",
+        order_by="SimulationJob.created_at",
+    )
     report: Mapped["Report | None"] = relationship(back_populates="simulation", cascade="all, delete-orphan", uselist=False)
+
+
+class SimulationJob(Base):
+    __tablename__ = "simulation_jobs"
+    __table_args__ = (UniqueConstraint("simulation_id", "job_name", name="uq_simulation_job_name"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    simulation_id: Mapped[str] = mapped_column(String(36), ForeignKey("simulation_runs.id"), index=True, nullable=False)
+    lab_id: Mapped[str] = mapped_column(String(36), ForeignKey("labs.id"), index=True, nullable=False)
+    namespace: Mapped[str] = mapped_column(String(120), nullable=False)
+    job_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    job_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="Creating", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    details_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+
+    simulation: Mapped["SimulationRun"] = relationship(back_populates="jobs")
 
 
 class SimulationLog(Base):

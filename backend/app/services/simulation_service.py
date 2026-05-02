@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.catalog import DEFENSES
@@ -14,6 +15,7 @@ from app.models import (
     DefenseRecommendation,
     Lab,
     Report,
+    SimulationJob,
     SimulationLog,
     SimulationRun,
     utcnow,
@@ -22,6 +24,10 @@ from app.models import (
 from app.services.kubernetes_service import KubernetesService
 
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+class SimulationCancelled(RuntimeError):
+    pass
 
 
 def active_defense_actions(db: Session, lab_id: str) -> list[DefenseAction]:
@@ -98,8 +104,34 @@ def run_simulation(
     suspicious_event_count = 0
     blocked = False
     blocked_at = None
+    simulation = SimulationRun(
+        id=simulation_id,
+        lab_id=lab.id,
+        scenario_id=scenario.id,
+        scenario_name=scenario.scenario_name,
+        attack_type=scenario.attack_type,
+        status="Running",
+        started_at=started_at,
+        completed_at=None,
+        risk_level="Unknown",
+        result_summary="Simulation is running.",
+        blocked=False,
+        blocked_at=None,
+        reached_services_json=[],
+        suspicious_event_count=0,
+        applied_defenses_json=[action.action_type for action in active_actions],
+        attack_path_json={"nodes": [], "edges": []},
+        comparison_json=None,
+    )
+    db.add(simulation)
+    db.commit()
+
+    def tracked_progress(event: dict[str, Any]) -> None:
+        _record_job_progress(db, simulation, event)
+        _emit_progress(progress_callback, event["type"], **{key: value for key, value in event.items() if key != "type"})
+
     _emit_progress(
-        progress_callback,
+        tracked_progress,
         "simulation_started",
         simulationId=simulation_id,
         labId=lab.id,
@@ -108,7 +140,7 @@ def run_simulation(
         mode=settings.kubernetes_mode,
     )
     _emit_progress(
-        progress_callback,
+        tracked_progress,
         "normal_traffic_generated",
         simulationId=simulation_id,
         eventCount=len(generated_logs),
@@ -122,7 +154,7 @@ def run_simulation(
             "target": raw_step.get("target", ""),
         }
         _emit_progress(
-            progress_callback,
+            tracked_progress,
             "attack_step_started",
             simulationId=simulation_id,
             source=step["source"],
@@ -164,7 +196,7 @@ def run_simulation(
             blocked = True
             blocked_at = step["target"]
             _emit_progress(
-                progress_callback,
+                tracked_progress,
                 "attack_step_blocked",
                 simulationId=simulation_id,
                 target=blocked_at,
@@ -172,7 +204,7 @@ def run_simulation(
             )
             break
         _emit_progress(
-            progress_callback,
+            tracked_progress,
             "attack_step_completed",
             simulationId=simulation_id,
             target=step["target"],
@@ -181,24 +213,32 @@ def run_simulation(
 
     if settings.kubernetes_mode == "real":
         _emit_progress(
-            progress_callback,
+            tracked_progress,
             "kubernetes_jobs_started",
             simulationId=simulation_id,
             namespace=lab.namespace,
         )
-        generated_logs = [
-            _coerce_job_log_record(item, started_at)
-            for item in KubernetesService().run_simulation_jobs(
+        try:
+            job_records = KubernetesService().run_simulation_jobs(
                 namespace=lab.namespace,
                 simulation_id=simulation_id,
                 services=service_definitions,
                 scenario_config=normalized_config,
                 normal_traffic=normal_traffic,
-                progress_callback=progress_callback,
+                progress_callback=tracked_progress,
             )
+        except Exception:
+            if _simulation_stop_requested(db, simulation_id):
+                return _finalize_cancelled_simulation(db, simulation, tracked_progress)
+            raise
+        if _simulation_stop_requested(db, simulation_id):
+            return _finalize_cancelled_simulation(db, simulation, tracked_progress)
+        generated_logs = [
+            _coerce_job_log_record(item, started_at)
+            for item in job_records
         ]
         _emit_progress(
-            progress_callback,
+            tracked_progress,
             "kubernetes_logs_collected",
             simulationId=simulation_id,
             eventCount=len(generated_logs),
@@ -236,10 +276,13 @@ def run_simulation(
                     }
                 )
 
+    if _simulation_stop_requested(db, simulation_id):
+        return _finalize_cancelled_simulation(db, simulation, tracked_progress)
+
     attack_path = _create_attack_path(service_definitions, path_steps, blocked_at)
     risk_level = _risk_after_defense(config.get("default_risk", "Medium"), blocked)
     _emit_progress(
-        progress_callback,
+        tracked_progress,
         "analysis_started",
         simulationId=simulation_id,
         suspiciousEventCount=suspicious_event_count,
@@ -257,31 +300,22 @@ def run_simulation(
         else f"Attack completed its simulated path through {' -> '.join(reached_services)}."
     )
 
-    simulation = SimulationRun(
-        id=simulation_id,
-        lab_id=lab.id,
-        scenario_id=scenario.id,
-        scenario_name=scenario.scenario_name,
-        attack_type=scenario.attack_type,
-        status="Completed",
-        started_at=started_at,
-        completed_at=utcnow(),
-        risk_level=risk_level,
-        result_summary=result_summary,
-        blocked=blocked,
-        blocked_at=blocked_at,
-        reached_services_json=reached_services,
-        suspicious_event_count=suspicious_event_count,
-        applied_defenses_json=[action.action_type for action in active_actions],
-        attack_path_json=attack_path,
-        comparison_json=comparison,
-    )
+    simulation.status = "Completed"
+    simulation.completed_at = utcnow()
+    simulation.risk_level = risk_level
+    simulation.result_summary = result_summary
+    simulation.blocked = blocked
+    simulation.blocked_at = blocked_at
+    simulation.reached_services_json = reached_services
+    simulation.suspicious_event_count = suspicious_event_count
+    simulation.applied_defenses_json = [action.action_type for action in active_actions]
+    simulation.attack_path_json = attack_path
+    simulation.comparison_json = comparison
     if simulation.comparison_json:
         simulation.comparison_json["postDefenseSimulationId"] = simulation.id
-    db.add(simulation)
     db.flush()
     _emit_progress(
-        progress_callback,
+        tracked_progress,
         "simulation_record_created",
         simulationId=simulation.id,
         riskLevel=risk_level,
@@ -314,13 +348,90 @@ def run_simulation(
 
     db.commit()
     _emit_progress(
-        progress_callback,
+        tracked_progress,
         "simulation_persisted",
         simulationId=simulation.id,
         logCount=len(generated_logs),
         riskLevel=risk_level,
     )
     return simulation
+
+
+def _simulation_stop_requested(db: Session, simulation_id: str) -> bool:
+    status = db.execute(select(SimulationRun.status).where(SimulationRun.id == simulation_id)).scalar_one_or_none()
+    return status in {"Stopping", "Stopped"}
+
+
+def _finalize_cancelled_simulation(
+    db: Session,
+    simulation: SimulationRun,
+    progress_callback: ProgressCallback | None,
+) -> SimulationRun:
+    simulation.status = "Stopped"
+    simulation.completed_at = simulation.completed_at or utcnow()
+    simulation.result_summary = "Simulation was stopped and active Kubernetes jobs were cancelled."
+    mark_simulation_jobs_cancelled(db, simulation.id)
+    db.commit()
+    _emit_progress(
+        progress_callback,
+        "simulation_cancelled",
+        simulationId=simulation.id,
+        logCount=len(simulation.logs),
+    )
+    return simulation
+
+
+def _record_job_progress(db: Session, simulation: SimulationRun, event: dict[str, Any]) -> None:
+    job_name = event.get("jobName")
+    if not job_name or not str(event.get("type", "")).startswith("kubernetes_job"):
+        return
+    job_type = event.get("jobType") or ("traffic" if "traffic" in job_name else "attack" if "attack" in job_name else "runner")
+    job = (
+        db.query(SimulationJob)
+        .filter(SimulationJob.simulation_id == simulation.id, SimulationJob.job_name == job_name)
+        .first()
+    )
+    if not job:
+        job = SimulationJob(
+            simulation_id=simulation.id,
+            lab_id=simulation.lab_id,
+            namespace=simulation.lab.namespace,
+            job_name=job_name,
+            job_type=job_type,
+            status="Creating",
+            details_json={},
+        )
+        db.add(job)
+
+    event_type = str(event.get("type", ""))
+    phase = event.get("phase")
+    status_by_event = {
+        "kubernetes_job_creating": "Creating",
+        "kubernetes_job_created": "Active",
+        "kubernetes_job_succeeded": "Succeeded",
+        "kubernetes_job_failed": "Failed",
+        "kubernetes_job_timeout": "TimedOut",
+    }
+    if event_type == "kubernetes_job_status" and phase:
+        job.status = str(phase)
+    else:
+        job.status = status_by_event.get(event_type, job.status)
+    job.job_type = str(job_type)
+    job.updated_at = utcnow()
+    if job.status in {"Succeeded", "Failed", "TimedOut", "Cancelled"}:
+        job.completed_at = job.completed_at or utcnow()
+    job.details_json = {**(job.details_json or {}), "lastEvent": event}
+    db.commit()
+
+
+def mark_simulation_jobs_cancelled(db: Session, simulation_id: str) -> None:
+    jobs = db.query(SimulationJob).filter(SimulationJob.simulation_id == simulation_id).all()
+    for job in jobs:
+        if job.status not in {"Succeeded", "Failed", "TimedOut", "Cancelled"}:
+            job.status = "Cancelled"
+            job.updated_at = utcnow()
+            job.completed_at = job.completed_at or utcnow()
+            job.details_json = {**(job.details_json or {}), "cancelled": True}
 
 
 def _emit_progress(callback: ProgressCallback | None, event_type: str, **payload: Any) -> None:

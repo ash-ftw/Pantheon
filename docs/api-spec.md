@@ -72,8 +72,10 @@ Create lab body:
 
 ```text
 POST /api/labs/{lab_id}/simulations
+WS   /api/labs/{lab_id}/simulations/stream?token={token}&scenario_id={scenario_id}
 POST /api/simulations/{simulation_id}/stop
 GET  /api/simulations/{simulation_id}
+GET  /api/simulations/{simulation_id}/jobs
 GET  /api/simulations/{simulation_id}/logs
 POST /api/simulations/{simulation_id}/analyze
 GET  /api/simulations/{simulation_id}/analysis
@@ -87,6 +89,8 @@ Run simulation body:
   "scenario_id": "multi-stage-chain"
 }
 ```
+
+Stop simulation cancels active Kubernetes Jobs labeled with the simulation ID in real mode and marks tracked `simulation_jobs` rows as `Cancelled`.
 
 ## Defenses
 

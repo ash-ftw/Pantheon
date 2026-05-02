@@ -187,6 +187,7 @@ class KubernetesService:
                     namespace=namespace,
                     simulation_id=simulation_id,
                     job_name=traffic_job,
+                    job_type="traffic",
                     command=["python", "traffic_generator.py"],
                     env={
                         "SIMULATION_ID_JSON": json.dumps(simulation_id),
@@ -201,6 +202,7 @@ class KubernetesService:
                     namespace=namespace,
                     simulation_id=simulation_id,
                     job_name=attack_job,
+                    job_type="attack",
                     command=["python", "runner.py"],
                     env={
                         "SIMULATION_ID_JSON": json.dumps(simulation_id),
@@ -229,6 +231,34 @@ class KubernetesService:
         if action_type in {"RATE_LIMIT", "RESOURCE_LIMIT"}:
             return [ResourceResult("Defense", action_type, "Applied", "Handled by simulation runner limits.")]
         return [ResourceResult("Defense", action_type, "Skipped", "No Kubernetes implementation for this defense.")]
+
+    def cancel_simulation_jobs(self, namespace: str, simulation_id: str) -> list[ResourceResult]:
+        self._validate_namespace(namespace)
+        if not simulation_id or any(part in simulation_id for part in ("/", "\\", "..", ":", "*", "?")):
+            raise KubernetesProvisioningError("Invalid simulation ID for job cancellation.")
+        if self.is_dry_run:
+            return [ResourceResult("Job", simulation_id, "Cancelled", "Dry-run job cancellation recorded.")]
+
+        self._connect()
+        try:
+            jobs = self._batch.list_namespaced_job(
+                namespace,
+                label_selector=f"pantheon.io/simulation-id={simulation_id}",
+            ).items
+        except Exception as exc:  # pragma: no cover - depends on cluster client
+            raise KubernetesProvisioningError(f"Unable to list active simulation jobs: {exc}") from exc
+
+        results: list[ResourceResult] = []
+        for job in jobs:
+            job_name = job.metadata.name
+            try:
+                self._delete_job(namespace, job_name)
+                results.append(ResourceResult("Job", job_name, "Cancelled", "Kubernetes job deletion requested."))
+            except Exception as exc:  # pragma: no cover - depends on cluster client
+                results.append(ResourceResult("Job", job_name, "Failed", str(exc)))
+        if not results:
+            results.append(ResourceResult("Job", simulation_id, "NotFound", "No active Kubernetes jobs found for simulation."))
+        return results
 
     def _dry_run_create(self, namespace: str, services: list[dict[str, Any]]) -> list[ResourceResult]:
         results = [
@@ -574,7 +604,9 @@ class KubernetesService:
         self,
         *,
         namespace: str,
+        simulation_id: str,
         job_name: str,
+        job_type: str,
         command: list[str],
         env: dict[str, str],
     ) -> ResourceResult:
@@ -585,14 +617,24 @@ class KubernetesService:
         body = client.V1Job(
             metadata=client.V1ObjectMeta(
                 name=job_name,
-                labels={"app.kubernetes.io/name": "pantheon", "pantheon.io/job-type": "simulation-runner"},
+                labels={
+                    "app.kubernetes.io/name": "pantheon",
+                    "pantheon.io/job-type": "simulation-runner",
+                    "pantheon.io/job-role": job_type,
+                    "pantheon.io/simulation-id": simulation_id,
+                },
             ),
             spec=client.V1JobSpec(
                 backoff_limit=0,
                 ttl_seconds_after_finished=120,
                 template=client.V1PodTemplateSpec(
                     metadata=client.V1ObjectMeta(
-                        labels={"app.kubernetes.io/name": "pantheon", "pantheon.io/job-type": "simulation-runner"}
+                        labels={
+                            "app.kubernetes.io/name": "pantheon",
+                            "pantheon.io/job-type": "simulation-runner",
+                            "pantheon.io/job-role": job_type,
+                            "pantheon.io/simulation-id": simulation_id,
+                        }
                     ),
                     spec=client.V1PodSpec(
                         restart_policy="Never",
@@ -634,6 +676,7 @@ class KubernetesService:
         namespace: str,
         simulation_id: str,
         job_name: str,
+        job_type: str,
         command: list[str],
         env: dict[str, str],
         progress_callback: ProgressCallback | None = None,
@@ -651,9 +694,17 @@ class KubernetesService:
             "kubernetes_job_creating",
             simulationId=simulation_id,
             jobName=job_name,
+            jobType=job_type,
             namespace=namespace,
         )
-        self._create_runner_job(namespace=namespace, job_name=job_name, command=command, env=env)
+        self._create_runner_job(
+            namespace=namespace,
+            simulation_id=simulation_id,
+            job_name=job_name,
+            job_type=job_type,
+            command=command,
+            env=env,
+        )
         records.append(
             self._observed_log_record(
                 simulation_id=simulation_id,
@@ -667,6 +718,7 @@ class KubernetesService:
             "kubernetes_job_created",
             simulationId=simulation_id,
             jobName=job_name,
+            jobType=job_type,
             namespace=namespace,
         )
         records.extend(self._wait_for_job(namespace, job_name, simulation_id, progress_callback))

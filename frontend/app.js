@@ -13,6 +13,7 @@ const state = {
   kubernetesPolling: false,
   simulationEvents: [],
   simulationStreaming: false,
+  simulationActiveId: "",
   loading: true,
   message: "",
   error: ""
@@ -36,7 +37,13 @@ function riskBadge(risk) {
 }
 
 function statusBadge(status) {
-  const color = status === "Running" ? "green" : status === "Stopped" ? "amber" : status === "Deleted" ? "red" : "blue";
+  const color = ["Running", "Succeeded", "Completed"].includes(status)
+    ? "green"
+    : ["Stopped", "Stopping", "Cancelled", "Pending", "Active", "Creating"].includes(status)
+      ? "amber"
+      : ["Deleted", "Failed", "TimedOut"].includes(status)
+        ? "red"
+        : "blue";
   return `<span class="badge ${color}">${escapeHtml(status)}</span>`;
 }
 
@@ -118,11 +125,13 @@ async function runSimulationWithProgress(lab, scenarioId) {
     let fallbackStarted = false;
     socket.onmessage = async (event) => {
       const payload = JSON.parse(event.data);
+      if (payload.simulationId) state.simulationActiveId = payload.simulationId;
       if (payload.type === "simulation_completed") {
         completed = true;
         await loadDashboard();
         state.simulation = payload.simulation;
         state.simulationStreaming = false;
+        state.simulationActiveId = "";
         state.message = "Simulation completed through WebSocket progress stream.";
         render();
         resolve(payload.simulation);
@@ -131,6 +140,7 @@ async function runSimulationWithProgress(lab, scenarioId) {
       if (payload.type === "simulation_error") {
         completed = true;
         state.simulationStreaming = false;
+        state.simulationActiveId = "";
         render();
         reject(new Error(payload.detail || "Simulation stream failed"));
         return;
@@ -164,6 +174,7 @@ async function runSimulationRest(lab, scenarioId, message) {
   await loadDashboard();
   state.simulation = result.simulation;
   state.simulationStreaming = false;
+  state.simulationActiveId = "";
   state.report = null;
   state.message = message;
   render();
@@ -739,7 +750,10 @@ function renderSimulationProgress() {
           <h2>Live Simulation Progress</h2>
           <p>${state.simulationStreaming ? "Streaming backend progress over WebSocket." : "Last streamed simulation events."}</p>
         </div>
-        <span class="badge ${state.simulationStreaming ? "green" : "blue"}">${state.simulationStreaming ? "streaming" : "complete"}</span>
+        <div class="button-row">
+          <span class="badge ${state.simulationStreaming ? "green" : "blue"}">${state.simulationStreaming ? "streaming" : "complete"}</span>
+          ${state.simulationActiveId ? `<button class="btn danger small" data-action="stop-active-simulation" data-simulation-id="${escapeHtml(state.simulationActiveId)}">Stop simulation</button>` : ""}
+        </div>
       </div>
       <div class="progress-list">
         ${events
@@ -779,6 +793,13 @@ function renderSimulation(simulation) {
     const raw = log.rawLogJson || {};
     return raw.observed_source || raw.observedSource;
   });
+  const activeJobs = (simulation.jobs || []).filter((job) => ["Creating", "Active", "Pending", "Running"].includes(job.status));
+  const analysis = simulation.aiAnalysis || {
+    classification: simulation.status === "Stopped" ? "Stopped" : "Pending",
+    riskLevel: simulation.riskLevel || "Unknown",
+    confidenceScore: 0,
+    explanation: "Analysis is not available until the simulation completes."
+  };
   return `
     <section class="panel">
       <div class="panel-header">
@@ -789,6 +810,8 @@ function renderSimulation(simulation) {
         <div class="button-row">
           ${riskBadge(simulation.riskLevel)}
           <span class="badge ${observedLogs.length ? "green" : "blue"}">${observedLogs.length} observed k8s logs</span>
+          <span class="badge ${activeJobs.length ? "amber" : "green"}">${activeJobs.length} active job(s)</span>
+          ${["Running", "Stopping"].includes(simulation.status) ? `<button class="btn danger" data-action="stop-active-simulation" data-simulation-id="${escapeHtml(simulation.id)}">Stop</button>` : ""}
           <button class="btn ghost" data-action="rerun-simulation" data-scenario-id="${escapeHtml(simulation.scenarioId)}">Rerun</button>
           <button class="btn primary" data-action="create-report" data-simulation-id="${escapeHtml(simulation.id)}">Generate report</button>
         </div>
@@ -802,15 +825,16 @@ function renderSimulation(simulation) {
           <h3>AI Classification</h3>
           <div class="defense-item">
             <div class="badge-row">
-              <span class="badge red">${escapeHtml(simulation.aiAnalysis.classification)}</span>
-              ${riskBadge(simulation.aiAnalysis.riskLevel)}
-              <span class="badge cyan">${Math.round(simulation.aiAnalysis.confidenceScore * 100)}% confidence</span>
+              <span class="badge red">${escapeHtml(analysis.classification)}</span>
+              ${riskBadge(analysis.riskLevel)}
+              <span class="badge cyan">${Math.round((analysis.confidenceScore || 0) * 100)}% confidence</span>
             </div>
-            <p class="muted">${escapeHtml(simulation.aiAnalysis.explanation)}</p>
+            <p class="muted">${escapeHtml(analysis.explanation)}</p>
           </div>
           ${renderComparison(simulation)}
         </div>
       </div>
+      ${renderSimulationJobs(simulation.jobs || [])}
       ${renderRecommendations(simulation)}
       ${renderLogs(simulation.logs)}
     </section>
@@ -894,6 +918,40 @@ function renderRecommendations(simulation) {
         </div>
       </div>
       <div class="list">${items}</div>
+    </section>
+  `;
+}
+
+function renderSimulationJobs(jobs) {
+  if (!jobs.length) return "";
+  return `
+    <section style="margin-top:16px">
+      <div class="panel-header">
+        <div>
+          <h3>Active Job Tracking</h3>
+          <p>Kubernetes runner jobs recorded for this simulation.</p>
+        </div>
+      </div>
+      <div class="table-wrap compact-table">
+        <table>
+          <thead><tr><th>Job</th><th>Type</th><th>Status</th><th>Namespace</th><th>Updated</th></tr></thead>
+          <tbody>
+            ${jobs
+              .map(
+                (job) => `
+                  <tr>
+                    <td>${escapeHtml(job.jobName)}</td>
+                    <td>${escapeHtml(job.jobType)}</td>
+                    <td>${statusBadge(job.status)}</td>
+                    <td>${escapeHtml(job.namespace)}</td>
+                    <td>${escapeHtml(new Date(job.updatedAt).toLocaleTimeString())}</td>
+                  </tr>
+                `
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>
     </section>
   `;
 }
@@ -1144,6 +1202,7 @@ app.addEventListener("click", async (event) => {
       state.kubernetesStatus = null;
       state.simulationEvents = [];
       state.simulationStreaming = false;
+      state.simulationActiveId = "";
       render();
     }
     if (action === "refresh") {
@@ -1160,6 +1219,7 @@ app.addEventListener("click", async (event) => {
       state.kubernetesStatus = null;
       state.simulationEvents = [];
       state.simulationStreaming = false;
+      state.simulationActiveId = "";
       render();
     }
     if (action === "start-lab" || action === "stop-lab") {
@@ -1180,6 +1240,7 @@ app.addEventListener("click", async (event) => {
       state.report = null;
       state.simulationEvents = [];
       state.simulationStreaming = false;
+      state.simulationActiveId = "";
       render();
     }
     if (action === "select-scenario") {
@@ -1208,6 +1269,18 @@ app.addEventListener("click", async (event) => {
       if (!lab) return;
       const scenarioId = target.dataset.scenarioId || state.selectedScenarioId;
       await runSimulationWithProgress(lab, scenarioId);
+    }
+    if (action === "stop-active-simulation") {
+      const result = await api(`/api/simulations/${target.dataset.simulationId}/stop`, {
+        method: "POST",
+        body: "{}"
+      });
+      await loadDashboard();
+      state.simulation = result.simulation;
+      state.simulationStreaming = false;
+      state.simulationActiveId = "";
+      state.message = "Simulation stopped and active Kubernetes jobs were cancelled.";
+      render();
     }
     if (action === "apply-defense") {
       const lab = selectedLab();

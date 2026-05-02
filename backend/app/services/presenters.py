@@ -10,6 +10,7 @@ from app.models import (
     Report,
     SimulationLog,
     SimulationRun,
+    SimulationJob,
     TargetApplication,
 )
 
@@ -182,10 +183,27 @@ def simulation_to_api(simulation: SimulationRun | None) -> dict | None:
         "appliedDefenseCount": len(simulation.applied_defenses_json),
         "appliedDefenses": simulation.applied_defenses_json,
         "logs": [log_to_api(item) for item in simulation.logs],
+        "jobs": [simulation_job_to_api(item) for item in simulation.jobs],
         "attackPath": simulation.attack_path_json,
         "aiAnalysis": analysis_to_api(simulation.ai_analysis),
         "recommendations": [recommendation_to_api(item) for item in simulation.recommendations],
         "comparison": simulation.comparison_json,
+    }
+
+
+def simulation_job_to_api(job: SimulationJob) -> dict:
+    return {
+        "id": job.id,
+        "simulationId": job.simulation_id,
+        "labId": job.lab_id,
+        "namespace": job.namespace,
+        "jobName": job.job_name,
+        "jobType": job.job_type,
+        "status": job.status,
+        "createdAt": job.created_at,
+        "updatedAt": job.updated_at,
+        "completedAt": job.completed_at,
+        "detailsJson": job.details_json,
     }
 
 

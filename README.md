@@ -21,6 +21,7 @@ Pantheon is a safe cyber-range project for learning Kubernetes attack paths and 
 - Observed Kubernetes job/pod lifecycle logs in real mode
 - WebSocket simulation progress streaming in the FastAPI backend
 - Deeper fake-service container access logs with request metadata, route family, latency, response size, and defense state
+- Active Kubernetes runner job tracking and real simulation cancellation
 
 Attack behavior is constrained to preset or custom safe scenarios inside the selected lab. In dry-run mode, Pantheon still uses generated logs and path data. In real Kubernetes mode, traffic and attack runners execute as Kubernetes Jobs and Pantheon records observed job, pod, and container-log events. The MVP does not attack real hosts, external IPs, domains, or local services outside the lab namespace.
 
@@ -132,7 +133,7 @@ docker compose run --rm --no-deps `
   api pytest -q
 ```
 
-Current tests cover the BYO web-app target workflow, custom scenario execution, WebSocket simulation progress, report target inclusion, external target rejection, duplicate service-name rejection, dry-run Kubernetes readiness polling, and observed Kubernetes log normalization.
+Current tests cover the BYO web-app target workflow, custom scenario execution, WebSocket simulation progress, active job cancellation, report target inclusion, external target rejection, duplicate service-name rejection, dry-run Kubernetes readiness polling, and observed Kubernetes log normalization.
 
 ## CI and Kind Integration
 
@@ -166,6 +167,18 @@ WS /api/labs/{lab_id}/simulations/stream?token={token}&scenario_id={scenario_id}
 The dashboard uses this stream when served by the FastAPI backend. The dependency-free Node demo keeps the existing REST simulation path as a fallback.
 
 Stream events include simulation start, normal traffic generation, attack step start/completion, Kubernetes Job status changes, runner log observation, service container log collection, analysis, persistence, and the final simulation result.
+
+## Active Job Tracking and Cancellation
+
+Pantheon records Kubernetes runner jobs in `simulation_jobs` with job name, type, namespace, status, timestamps, and last observed event. The dashboard shows these jobs under each simulation result.
+
+To stop a running simulation:
+
+```text
+POST /api/simulations/{simulation_id}/stop
+```
+
+In real Kubernetes mode, Pantheon deletes active Jobs labeled with the simulation ID and marks tracked jobs as `Cancelled`. In dry-run mode, it records the cancellation without touching a cluster.
 
 ## Fake-Service vs Real-Service Containers
 
@@ -233,7 +246,7 @@ pantheon/
 
 ## Next Engineering Step
 
-The production backend path now covers the full demo workflow: auth, templates, scenarios, labs, simulations, logs, AI analysis, defenses, comparisons, reports, dashboard serving, fake service containers, Kubernetes Job-based traffic/attack runners, live pod/job status polling, WebSocket simulation progress, observed Kubernetes lifecycle logs, deeper service access logs, Alembic migration scaffolding, API tests, CI image builds, and Kind integration coverage. The next implementation steps are:
+The production backend path now covers the full demo workflow: auth, templates, scenarios, labs, simulations, logs, AI analysis, defenses, comparisons, reports, dashboard serving, fake service containers, Kubernetes Job-based traffic/attack runners, active job tracking/cancellation, live pod/job status polling, WebSocket simulation progress, observed Kubernetes lifecycle logs, deeper service access logs, Alembic migration scaffolding, API tests, CI image builds, and Kind integration coverage. The next implementation steps are:
 
 - add a full in-dashboard service-log detail drawer
 - add CI publishing for versioned local images
