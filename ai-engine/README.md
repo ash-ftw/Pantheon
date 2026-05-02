@@ -1,12 +1,19 @@
 # AI Engine
 
-The MVP uses deterministic classification based on preset scenario labels and generated log features. This keeps the demonstration stable and explainable.
+Pantheon still keeps deterministic rule-based explanations in the API so demos are stable. This folder now adds a runnable synthetic-data path for the richer AI/anomaly PRD item.
 
-Suggested replacement plan:
+## Generate Training Data
 
-1. Generate synthetic logs for every preset scenario.
-2. Extract features such as request count, failed login count, endpoint diversity, payload category, request rate, service hop count, and blocked request count.
-3. Train a Random Forest classifier for known attack categories.
-4. Add Isolation Forest for anomaly detection.
-5. Keep the rule-based explanation and recommendation layer for readable student output.
+```powershell
+cd D:\Pantheon
+C:\Python314\python.exe ai-engine\generate_synthetic_dataset.py --rows 420 --output ai-engine\synthetic_training_logs.csv
+```
 
+## Train Baseline Artifact
+
+```powershell
+cd D:\Pantheon
+C:\Python314\python.exe ai-engine\train_baseline_model.py --input ai-engine\synthetic_training_logs.csv --output ai-engine\model_artifact.json
+```
+
+The generated artifact is dependency-free and stores class centroids, feature spread, and anomaly policy thresholds. It gives the project a concrete model path that can later be replaced by scikit-learn Random Forest and Isolation Forest without changing the upstream log-feature contract.

@@ -9,6 +9,8 @@ const state = {
   selectedScenarioId: "multi-stage-chain",
   simulation: null,
   report: null,
+  selectedLog: null,
+  adminLabs: [],
   kubernetesStatus: null,
   kubernetesPolling: false,
   simulationEvents: [],
@@ -59,6 +61,38 @@ async function api(path, options = {}) {
     throw new Error(data.detail || data.error || `Request failed with status ${response.status}`);
   }
   return data;
+}
+
+async function refreshAdminLabs() {
+  if (state.user?.role !== "Admin") {
+    state.adminLabs = [];
+    return;
+  }
+  try {
+    const result = await api("/api/admin/labs");
+    state.adminLabs = result.labs || [];
+  } catch {
+    state.adminLabs = [];
+  }
+}
+
+async function downloadReportPdf(reportId) {
+  const headers = {};
+  if (state.token) headers.Authorization = `Bearer ${state.token}`;
+  const response = await fetch(`/api/reports/${encodeURIComponent(reportId)}/pdf`, { headers });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.detail || data.error || `PDF export failed with status ${response.status}`);
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `pantheon-report-${reportId}.pdf`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 
 function setMessage(message, isError = false) {
@@ -221,6 +255,7 @@ async function loadDashboard() {
   if (scenarios.length && !scenarios.some((scenario) => scenario.id === state.selectedScenarioId)) {
     state.selectedScenarioId = scenarios[0].id;
   }
+  await refreshAdminLabs();
 }
 
 function selectedLab() {
@@ -238,6 +273,14 @@ function compatibleScenarios(lab) {
 function latestSimulationForLab(lab) {
   if (state.simulation && state.simulation.labId === lab?.id) return state.simulation;
   return lab?.latestSimulation || null;
+}
+
+function parseCustomSteps(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return null;
+  const parsed = JSON.parse(trimmed);
+  if (!Array.isArray(parsed)) throw new Error("Scenario steps JSON must be an array.");
+  return parsed;
 }
 
 function renderAuth() {
@@ -325,6 +368,7 @@ function renderDashboard() {
           ${state.error ? `<div class="alert">${escapeHtml(state.error)}</div>` : ""}
           ${state.message ? `<div class="success">${escapeHtml(state.message)}</div>` : ""}
           ${renderMetrics()}
+          ${state.user?.role === "Admin" ? renderAdminPanel() : ""}
           ${lab ? renderLabDetail(lab, simulation) : renderNoLab()}
           ${lab ? renderKubernetesStatus(lab) : ""}
           ${lab ? renderTargetApps(lab) : ""}
@@ -335,6 +379,7 @@ function renderDashboard() {
         </section>
       </section>
     </main>
+    ${renderLogDrawer()}
   `;
 }
 
@@ -422,6 +467,59 @@ function renderMetrics() {
       <div class="metric"><strong>${defenses}</strong><span>Applied defenses</span></div>
     </section>
     ${critical ? `<div class="alert">${critical} latest simulation(s) still show critical risk.</div>` : ""}
+  `;
+}
+
+function renderAdminPanel() {
+  const rows = (state.adminLabs || [])
+    .map(
+      (lab) => `
+        <tr>
+          <td>
+            <strong>${escapeHtml(lab.labName)}</strong>
+            <div class="muted tiny">${escapeHtml(lab.namespace)}</div>
+          </td>
+          <td>${escapeHtml(lab.owner?.email || lab.userId)}</td>
+          <td>${statusBadge(lab.status)}</td>
+          <td>${escapeHtml(lab.namespaceStatus?.serviceCount ?? lab.services?.length ?? 0)}</td>
+          <td>${escapeHtml(lab.namespaceStatus?.targetApplicationCount ?? lab.targetApplications?.length ?? 0)}</td>
+          <td>${lab.errorMessage ? `<span class="badge red">${escapeHtml(lab.errorMessage)}</span>` : `<span class="badge green">clear</span>`}</td>
+          <td>
+            <div class="button-row">
+              <button class="btn small ghost" data-action="admin-refresh-lab-status" data-lab-id="${escapeHtml(lab.id)}">Status</button>
+              <button class="btn small danger" data-action="admin-cleanup-lab" data-lab-id="${escapeHtml(lab.id)}">Cleanup</button>
+            </div>
+          </td>
+        </tr>
+      `
+    )
+    .join("");
+  return `
+    <section class="panel admin-panel">
+      <div class="panel-header">
+        <div>
+          <h2>Admin Panel</h2>
+          <p>Review all lab namespaces, refresh status, and clean up stuck resources.</p>
+        </div>
+        <button class="btn ghost" data-action="load-admin-labs">Refresh admin view</button>
+      </div>
+      <div class="table-wrap compact-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Lab</th>
+              <th>Owner</th>
+              <th>Status</th>
+              <th>Services</th>
+              <th>Targets</th>
+              <th>Error</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>${rows || `<tr><td colspan="7"><div class="empty">No labs visible to admin.</div></td></tr>`}</tbody>
+        </table>
+      </div>
+    </section>
   `;
 }
 
@@ -544,12 +642,19 @@ function renderKubernetesStatus(lab) {
 }
 
 function renderTargetApps(lab) {
+  const targetByService = new Map((lab.targetApplications || []).map((target) => [target.serviceName, target]));
   const serviceOptions = lab.services
-    .map((service) => `<option value="${escapeHtml(service.serviceName)}">${escapeHtml(service.serviceName)} (${escapeHtml(service.serviceType)})</option>`)
+    .map((service) => {
+      const target = targetByService.get(service.serviceName);
+      const label = target ? `${service.serviceName} (${target.status} target-app)` : `${service.serviceName} (${service.serviceType})`;
+      return `<option value="${escapeHtml(service.serviceName)}">${escapeHtml(label)}</option>`;
+    })
     .join("");
   const targetCards = (lab.targetApplications || [])
     .map(
-      (target) => `
+      (target) => {
+        const health = target.manifestJson?.health_validation || target.manifestJson?.healthValidation || {};
+        return `
         <article class="target-card">
           <div class="lab-title">
             <div>
@@ -563,9 +668,15 @@ function renderTargetApps(lab) {
             <span class="badge green">${escapeHtml(target.safetyState)}</span>
             <span class="badge green">internal target</span>
             ${target.image ? `<span class="badge">${escapeHtml(target.image)}</span>` : ""}
+            ${health.observedAt ? `<span class="badge ${health.ready ? "green" : "amber"}">health ${health.ready ? "ready" : "pending"}</span>` : `<span class="badge amber">health unchecked</span>`}
+          </div>
+          ${health.message ? `<p class="muted tiny">${escapeHtml(health.message)}</p>` : ""}
+          <div class="button-row" style="margin-top:10px">
+            <button class="btn small ghost" data-action="validate-target-app" data-target-id="${escapeHtml(target.id)}">Validate health</button>
           </div>
         </article>
-      `
+      `;
+      }
     )
     .join("");
   return `
@@ -689,6 +800,18 @@ function renderTargetApps(lab) {
               <option>Critical</option>
               <option>Low</option>
             </select>
+          </div>
+          <div class="field">
+            <label for="custom-signal">Expected signal</label>
+            <input id="custom-signal" name="expected_signal" value="custom_web_app_signal" />
+          </div>
+          <div class="field">
+            <label for="custom-rate-limit">Rate limit / min</label>
+            <input id="custom-rate-limit" name="rate_limit_per_minute" type="number" min="1" max="600" value="60" />
+          </div>
+          <div class="field span-2">
+            <label for="custom-steps-json">Multi-step JSON</label>
+            <textarea id="custom-steps-json" name="steps_json" rows="5" placeholder='[{"target":"my-web-app","method":"GET","endpoint":"/health","payload_category":"custom_probe","expected_signal":"health_probe","count":4}]'></textarea>
           </div>
         </div>
         <button class="btn primary" type="submit" ${!lab.services.length ? "disabled" : ""}>Create custom scenario</button>
@@ -992,7 +1115,10 @@ function renderLogs(logs) {
           <td>${escapeHtml(log.statusCode)}</td>
           <td>${log.isAttackSimulation ? `<span class="badge amber">attack</span>` : `<span class="badge green">normal</span>`}</td>
           <td><span class="badge ${observedSource.includes("service") ? "cyan" : observedSource === "generated" ? "blue" : "green"}">${escapeHtml(observedSource)}</span></td>
-          <td>${routeFamily ? `<span class="badge">${escapeHtml(routeFamily)}</span>` : ""}${latency !== undefined ? `<span class="badge cyan">${escapeHtml(latency)} ms</span>` : ""}</td>
+          <td>
+            ${routeFamily ? `<span class="badge">${escapeHtml(routeFamily)}</span>` : ""}${latency !== undefined ? `<span class="badge cyan">${escapeHtml(latency)} ms</span>` : ""}
+            <button class="btn small ghost row-action" data-action="open-log-detail" data-log-id="${escapeHtml(log.id)}">Details</button>
+          </td>
         </tr>
       `;
     })
@@ -1026,6 +1152,42 @@ function renderLogs(logs) {
   `;
 }
 
+function renderLogDrawer() {
+  const log = state.selectedLog;
+  if (!log) return "";
+  const raw = log.rawLogJson || {};
+  const rawJson = JSON.stringify(raw, null, 2);
+  const observedSource = raw.observed_source || raw.observedSource || "generated";
+  return `
+    <div class="drawer-backdrop" data-action="close-log-detail"></div>
+    <aside class="log-drawer" aria-label="Service log details">
+      <div class="panel-header">
+        <div>
+          <h2>Service Log Detail</h2>
+          <p>${escapeHtml(log.sourceService)} -> ${escapeHtml(log.targetService)}</p>
+        </div>
+        <button class="btn small ghost" data-action="close-log-detail">Close</button>
+      </div>
+      <div class="indicator-track drawer-indicators">
+        <div class="indicator ${log.isAttackSimulation ? "bad" : "good"}"><span class="dot"></span><strong>${log.isAttackSimulation ? "Attack" : "Normal"}</strong><small>label</small></div>
+        <div class="indicator info"><span class="dot"></span><strong>${escapeHtml(log.statusCode)}</strong><small>status code</small></div>
+        <div class="indicator info"><span class="dot"></span><strong>${escapeHtml(log.severity)}</strong><small>severity</small></div>
+        <div class="indicator good"><span class="dot"></span><strong>${escapeHtml(observedSource)}</strong><small>observed source</small></div>
+      </div>
+      <div class="kv-grid">
+        <div><span>Timestamp</span><strong>${escapeHtml(new Date(log.timestamp).toLocaleString())}</strong></div>
+        <div><span>Method</span><strong>${escapeHtml(log.method)}</strong></div>
+        <div><span>Endpoint</span><strong>${escapeHtml(log.endpoint)}</strong></div>
+        <div><span>Event</span><strong>${escapeHtml(log.eventType)}</strong></div>
+        <div><span>Payload</span><strong>${escapeHtml(log.payloadCategory)}</strong></div>
+        <div><span>Request count</span><strong>${escapeHtml(log.requestCount)}</strong></div>
+      </div>
+      <h3>Raw Observed Payload</h3>
+      <pre class="json-block">${escapeHtml(rawJson)}</pre>
+    </aside>
+  `;
+}
+
 function renderReport(report) {
   const body = report.reportJson;
   return `
@@ -1035,7 +1197,10 @@ function renderReport(report) {
           <h2>${escapeHtml(report.title)}</h2>
           <p>${escapeHtml(report.summary)}</p>
         </div>
-        <span class="badge cyan">${escapeHtml(new Date(report.createdAt).toLocaleString())}</span>
+        <div class="button-row">
+          <span class="badge cyan">${escapeHtml(new Date(report.createdAt).toLocaleString())}</span>
+          <button class="btn primary" data-action="download-report-pdf" data-report-id="${escapeHtml(report.id)}">Export PDF</button>
+        </div>
       </div>
       <div class="report-section">
         <h4>Lab Information</h4>
@@ -1164,7 +1329,10 @@ app.addEventListener("submit", async (event) => {
           endpoint: form.get("endpoint"),
           payload_category: form.get("payload_category"),
           request_count: Number(form.get("request_count") || 12),
-          risk_level: form.get("risk_level")
+          risk_level: form.get("risk_level"),
+          expected_signal: form.get("expected_signal"),
+          rate_limit_per_minute: Number(form.get("rate_limit_per_minute") || 60),
+          steps: parseCustomSteps(form.get("steps_json"))
         })
       });
       state.selectedScenarioId = result.scenario.id;
@@ -1199,6 +1367,8 @@ app.addEventListener("click", async (event) => {
       stopKubernetesPolling();
       state.simulation = null;
       state.report = null;
+      state.selectedLog = null;
+      state.adminLabs = [];
       state.kubernetesStatus = null;
       state.simulationEvents = [];
       state.simulationStreaming = false;
@@ -1210,12 +1380,30 @@ app.addEventListener("click", async (event) => {
       state.message = "Dashboard refreshed.";
       render();
     }
+    if (action === "load-admin-labs") {
+      await refreshAdminLabs();
+      state.message = "Admin lab list refreshed.";
+      render();
+    }
+    if (action === "admin-refresh-lab-status") {
+      await api(`/api/admin/labs/${target.dataset.labId}/status`, { method: "POST", body: "{}" });
+      await refreshAdminLabs();
+      state.message = "Admin namespace status refreshed.";
+      render();
+    }
+    if (action === "admin-cleanup-lab") {
+      await api(`/api/admin/labs/${target.dataset.labId}/cleanup`, { method: "POST", body: "{}" });
+      await loadDashboard();
+      state.message = "Admin cleanup requested for lab namespace.";
+      render();
+    }
     if (action === "select-lab") {
       state.selectedLabId = target.dataset.labId;
       localStorage.setItem("pantheon_selected_lab", state.selectedLabId);
       stopKubernetesPolling();
       state.simulation = null;
       state.report = null;
+      state.selectedLog = null;
       state.kubernetesStatus = null;
       state.simulationEvents = [];
       state.simulationStreaming = false;
@@ -1245,6 +1433,17 @@ app.addEventListener("click", async (event) => {
     }
     if (action === "select-scenario") {
       state.selectedScenarioId = target.dataset.scenarioId;
+      render();
+    }
+    if (action === "validate-target-app") {
+      const lab = selectedLab();
+      if (!lab) return;
+      const result = await api(`/api/labs/${lab.id}/target-apps/${target.dataset.targetId}/validate`, {
+        method: "POST",
+        body: "{}"
+      });
+      state.labs = state.labs.map((item) => (item.id === result.lab.id ? result.lab : item));
+      state.message = result.health?.ready ? "Target app health validated." : "Target app is not ready yet.";
       render();
     }
     if (action === "poll-kubernetes") {
@@ -1303,6 +1502,20 @@ app.addEventListener("click", async (event) => {
       });
       state.report = result.report;
       state.message = "Report generated.";
+      render();
+    }
+    if (action === "download-report-pdf") {
+      await downloadReportPdf(target.dataset.reportId);
+      state.message = "PDF report export started.";
+      render();
+    }
+    if (action === "open-log-detail") {
+      const logs = state.simulation?.logs || selectedLab()?.latestSimulation?.logs || [];
+      state.selectedLog = logs.find((log) => log.id === target.dataset.logId) || null;
+      render();
+    }
+    if (action === "close-log-detail") {
+      state.selectedLog = null;
       render();
     }
   } catch (error) {

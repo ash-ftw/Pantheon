@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.config import settings
 from app.database import get_db
 from app.dependencies import can_access_lab, get_current_user
-from app.models import AttackScenario, Lab, ServiceInstance, TargetApplication, User
+from app.models import AttackScenario, Lab, ServiceInstance, TargetApplication, User, utcnow
 from app.schemas import CustomScenarioCreate, ScenarioOut, TargetApplicationCreate, TargetApplicationOut
 from app.services.kubernetes_service import KubernetesProvisioningError, KubernetesService
 from app.services.presenters import lab_to_api, scenario_to_api, target_application_to_api
@@ -21,6 +21,7 @@ _SERVICE_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 _ALLOWED_IMPORT_TYPES = {"docker-image", "kubernetes-yaml", "local-service"}
 _ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}
 _ALLOWED_RISKS = {"Low", "Medium", "High", "Critical"}
+_HEALTHY_TARGET_STATUSES = {"Healthy"}
 
 
 def _load_lab(db: Session, lab_id: str) -> Lab | None:
@@ -54,6 +55,14 @@ def _assert_safe_service_name(service_name: str) -> None:
 
 def _target_service_names(lab: Lab) -> set[str]:
     return {item.service_name for item in lab.services}
+
+
+def _target_application_by_service(lab: Lab, service_name: str) -> TargetApplication | None:
+    return next((item for item in lab.target_applications if item.service_name == service_name), None)
+
+
+def _service_instance_by_name(lab: Lab, service_name: str) -> ServiceInstance | None:
+    return next((item for item in lab.services if item.service_name == service_name), None)
 
 
 @router.post("/labs/{lab_id}/target-apps", status_code=status.HTTP_201_CREATED)
@@ -166,6 +175,74 @@ def list_target_applications(
     return {"targetApplications": [target_application_to_api(item) for item in lab.target_applications]}
 
 
+@router.post("/labs/{lab_id}/target-apps/{target_id}/validate")
+def validate_target_application_health(
+    lab_id: str,
+    target_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict:
+    lab = _load_lab(db, lab_id)
+    if not lab or not can_access_lab(user, lab.user_id):
+        raise HTTPException(status_code=404, detail="Lab not found")
+    target = next((item for item in lab.target_applications if item.id == target_id), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="Target application not found")
+
+    service_instance = _service_instance_by_name(lab, target.service_name)
+    health = {
+        "serviceName": target.service_name,
+        "healthPath": target.health_path,
+        "ready": False,
+        "status": "Unknown",
+        "message": "",
+        "observedAt": utcnow().isoformat(),
+    }
+    try:
+        status_payload = KubernetesService().get_lab_status(lab.namespace, service_definitions_for_lab(lab))
+        service_status = next(
+            (item for item in status_payload.get("services", []) if item.get("name") == target.service_name),
+            None,
+        )
+        service_state = service_status.get("status", "Missing") if service_status else "Missing"
+        ready = service_state == "Running"
+        health.update(
+            {
+                "ready": ready,
+                "status": service_state,
+                "message": "Target app is ready for internal scenarios."
+                if ready
+                else "Target app is not ready. Check pod status and service configuration before running scenarios.",
+                "details": service_status or {},
+            }
+        )
+        target.status = "Healthy" if ready else "Unhealthy"
+        if service_instance:
+            service_instance.status = "Running" if ready else service_state
+        lab.error_message = None if ready else health["message"]
+    except KubernetesProvisioningError as exc:
+        health.update({"ready": False, "status": "Unhealthy", "message": str(exc)})
+        target.status = "Unhealthy"
+        if service_instance:
+            service_instance.status = "Unhealthy"
+        lab.error_message = str(exc)
+
+    target.manifest_json = {
+        **(target.manifest_json or {}),
+        "health_validation": health,
+    }
+    db.commit()
+    loaded = _load_lab(db, lab.id)
+    if not loaded:
+        raise HTTPException(status_code=500, detail="Target app was validated but lab could not be loaded")
+    validated = next((item for item in loaded.target_applications if item.id == target_id), None)
+    return {
+        "targetApplication": target_application_to_api(validated or target),
+        "health": health,
+        "lab": lab_to_api(loaded),
+    }
+
+
 @router.post("/labs/{lab_id}/custom-scenarios", response_model=dict[str, ScenarioOut], status_code=status.HTTP_201_CREATED)
 def create_custom_scenario(
     lab_id: str,
@@ -178,54 +255,33 @@ def create_custom_scenario(
         raise HTTPException(status_code=404, detail="Lab not found")
 
     target_service = (payload.target_service or payload.targetService or "").strip()
-    if not target_service:
+    raw_steps = payload.steps or []
+    if not target_service and not raw_steps:
         raise HTTPException(status_code=400, detail="targetService is required")
-    if "://" in target_service or "/" in target_service or target_service not in _target_service_names(lab):
-        raise HTTPException(status_code=400, detail="Custom scenario target must be an internal service in this lab")
-
-    method = payload.method.upper().strip()
-    if method not in _ALLOWED_METHODS:
-        raise HTTPException(status_code=400, detail="Unsupported HTTP method for safe scenario template")
-
-    endpoint = payload.endpoint.strip() or "/"
-    if "://" in endpoint:
-        raise HTTPException(status_code=400, detail="Endpoint must be a path, not a URL")
-    if not endpoint.startswith("/"):
-        endpoint = f"/{endpoint}"
 
     attack_type = (payload.attack_type or payload.attackType or "Custom Web App Probe").strip()
-    payload_category = (payload.payload_category or payload.payloadCategory or "custom_probe").strip()
     risk_level = (payload.risk_level or payload.riskLevel or "Medium").strip()
     if risk_level not in _ALLOWED_RISKS:
         risk_level = "Medium"
-    request_count = payload.request_count or payload.requestCount or 12
+    steps = _scenario_steps_from_payload(payload, lab, target_service)
+    target_services = []
+    for step in steps:
+        if step["target"] not in target_services:
+            target_services.append(step["target"])
 
     scenario = AttackScenario(
         id=f"custom-{lab.id[:8]}-{uuid4().hex[:8]}",
         scenario_name=payload.name,
-        description=f"User-defined safe scenario targeting {target_service} inside {lab.namespace}.",
+        description=f"User-defined safe scenario targeting {', '.join(target_services)} inside {lab.namespace}.",
         difficulty="Custom",
         attack_type=attack_type,
         scenario_config_json={
             "is_custom": True,
             "custom_lab_id": lab.id,
             "allowed_template_ids": [lab.template_id],
-            "target_services": [target_service],
+            "target_services": target_services,
             "default_risk": risk_level,
-            "steps": [
-                {
-                    "order": 1,
-                    "action_type": "CUSTOM_WEB_APP_REQUEST_PATTERN",
-                    "source": "attack-pod",
-                    "target": target_service,
-                    "method": method,
-                    "endpoint": endpoint,
-                    "event_type": "custom_web_app_signal",
-                    "payload_category": payload_category,
-                    "status_code": 200,
-                    "count": request_count,
-                }
-            ],
+            "steps": steps,
         },
     )
     db.add(scenario)
@@ -247,3 +303,75 @@ def _target_to_service_definition(target: TargetApplication) -> dict:
         "local_url": target.manifest_json.get("local_url"),
         "normal_paths": target.manifest_json.get("normal_paths", []),
     }
+
+
+def _scenario_steps_from_payload(payload: CustomScenarioCreate, lab: Lab, fallback_target: str) -> list[dict]:
+    raw_steps = payload.steps or []
+    if not raw_steps:
+        raw_steps = [
+            {
+                "target": fallback_target,
+                "method": payload.method,
+                "endpoint": payload.endpoint,
+                "payload_category": payload.payload_category or payload.payloadCategory,
+                "expected_signal": payload.expected_signal or payload.expectedSignal,
+                "count": payload.request_count or payload.requestCount,
+                "rate_limit_per_minute": payload.rate_limit_per_minute or payload.rateLimitPerMinute,
+            }
+        ]
+
+    steps: list[dict] = []
+    for index, raw_step in enumerate(raw_steps, start=1):
+        target = str(raw_step.get("target") or raw_step.get("target_service") or raw_step.get("targetService") or "").strip()
+        _assert_internal_target_ready(lab, target)
+
+        method = str(raw_step.get("method") or "GET").upper().strip()
+        if method not in _ALLOWED_METHODS:
+            raise HTTPException(status_code=400, detail=f"Unsupported HTTP method in step {index}")
+
+        endpoint = str(raw_step.get("endpoint") or "/").strip() or "/"
+        if "://" in endpoint:
+            raise HTTPException(status_code=400, detail=f"Step {index} endpoint must be a path, not a URL")
+        if not endpoint.startswith("/") and not endpoint.startswith("tcp/"):
+            endpoint = f"/{endpoint}"
+
+        payload_category = str(raw_step.get("payload_category") or raw_step.get("payloadCategory") or "custom_probe").strip()
+        event_type = str(
+            raw_step.get("expected_signal")
+            or raw_step.get("expectedSignal")
+            or raw_step.get("event_type")
+            or raw_step.get("eventType")
+            or "custom_web_app_signal"
+        ).strip()
+        count = int(raw_step.get("count") or raw_step.get("request_count") or raw_step.get("requestCount") or 12)
+        count = max(1, min(count, 100))
+        rate_limit = raw_step.get("rate_limit_per_minute") or raw_step.get("rateLimitPerMinute")
+        rate_limit_value = max(1, min(int(rate_limit), 600)) if rate_limit else None
+
+        step = {
+            "order": index,
+            "action_type": str(raw_step.get("action_type") or raw_step.get("actionType") or "CUSTOM_WEB_APP_REQUEST_PATTERN"),
+            "source": str(raw_step.get("source") or "attack-pod"),
+            "target": target,
+            "method": method,
+            "endpoint": endpoint,
+            "event_type": event_type,
+            "payload_category": payload_category,
+            "status_code": int(raw_step.get("status_code") or raw_step.get("statusCode") or 200),
+            "count": count,
+        }
+        if rate_limit_value:
+            step["rate_limit_per_minute"] = rate_limit_value
+        steps.append(step)
+    return steps
+
+
+def _assert_internal_target_ready(lab: Lab, target_service: str) -> None:
+    if not target_service or "://" in target_service or "/" in target_service or target_service not in _target_service_names(lab):
+        raise HTTPException(status_code=400, detail="Custom scenario target must be an internal service in this lab")
+    target_app = _target_application_by_service(lab, target_service)
+    if target_app and target_app.status not in _HEALTHY_TARGET_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Validate health for target app {target_service} before creating scenarios.",
+        )

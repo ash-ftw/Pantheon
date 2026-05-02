@@ -556,6 +556,10 @@ textarea:focus {
   padding: 12px;
 }
 
+.admin-panel {
+  border-color: #c7d2fe;
+}
+
 .target-service {
   border-color: #99f6e4;
   box-shadow: inset 3px 0 0 var(--cyan);
@@ -752,6 +756,78 @@ th {
 
 td {
   font-size: 0.9rem;
+}
+
+.row-action {
+  margin-left: 6px;
+  min-height: 28px;
+  padding: 5px 8px;
+}
+
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  background: rgba(15, 23, 42, 0.38);
+}
+
+.log-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: 31;
+  width: min(520px, 100vw);
+  height: 100vh;
+  overflow: auto;
+  padding: 18px;
+  background: var(--surface);
+  border-left: 1px solid var(--line);
+  box-shadow: -18px 0 36px rgba(18, 32, 51, 0.18);
+}
+
+.drawer-indicators {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.kv-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 14px 0;
+}
+
+.kv-grid div {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px;
+  background: #fbfcfe;
+  min-width: 0;
+}
+
+.kv-grid span {
+  display: block;
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 800;
+  margin-bottom: 4px;
+}
+
+.kv-grid strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.json-block {
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  max-height: 360px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #0f172a;
+  color: #e2e8f0;
+  font-size: 0.82rem;
+  line-height: 1.45;
 }
 
 .alert {

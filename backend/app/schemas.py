@@ -126,6 +126,11 @@ class CustomScenarioCreate(BaseModel):
     requestCount: int | None = Field(default=None, ge=1, le=100)
     risk_level: str | None = None
     riskLevel: str | None = None
+    expected_signal: str | None = None
+    expectedSignal: str | None = None
+    rate_limit_per_minute: int | None = Field(default=None, ge=1, le=600)
+    rateLimitPerMinute: int | None = Field(default=None, ge=1, le=600)
+    steps: list[dict[str, Any]] | None = None
 
 
 class LabOut(BaseModel):

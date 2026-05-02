@@ -177,6 +177,24 @@ def test_byo_target_custom_scenario_simulation_and_report() -> None:
         assert target["safetyState"] == "Contained"
         assert target["internalUrl"] == f"http://{service_name}:8080"
 
+        blocked_scenario_response = client.post(
+            f"/api/labs/{lab['id']}/custom-scenarios",
+            headers=headers,
+            json={
+                "name": "Blocked Unvalidated Probe",
+                "targetService": service_name,
+                "endpoint": "/login",
+            },
+        )
+        assert blocked_scenario_response.status_code == 409
+
+        validation_response = client.post(
+            f"/api/labs/{lab['id']}/target-apps/{target['id']}/validate",
+            headers=headers,
+        )
+        assert validation_response.status_code == 200, validation_response.text
+        assert validation_response.json()["health"]["ready"] is True
+
         scenario_response = client.post(
             f"/api/labs/{lab['id']}/custom-scenarios",
             headers=headers,
@@ -189,6 +207,8 @@ def test_byo_target_custom_scenario_simulation_and_report() -> None:
                 "payloadCategory": "sql_meta_characters",
                 "riskLevel": "High",
                 "requestCount": 5,
+                "expectedSignal": "suspicious_input_pattern",
+                "rateLimitPerMinute": 45,
             },
         )
         assert scenario_response.status_code == 201, scenario_response.text
@@ -217,6 +237,83 @@ def test_byo_target_custom_scenario_simulation_and_report() -> None:
         report = report_response.json()["report"]
         target_services = [item["serviceName"] for item in report["reportJson"]["targetApplications"]]
         assert service_name in target_services
+
+        pdf_response = client.get(f"/api/reports/{report['id']}/pdf", headers=headers)
+        assert pdf_response.status_code == 200, pdf_response.text
+        assert pdf_response.headers["content-type"] == "application/pdf"
+        assert pdf_response.content.startswith(b"%PDF-1.4")
+
+
+def test_custom_multi_step_scenario_and_admin_cleanup() -> None:
+    with TestClient(app) as client:
+        student_headers = auth_headers(client)
+        admin_login = client.post(
+            "/api/auth/login",
+            json={"email": "admin@pantheon.local", "password": "admin123"},
+        )
+        assert admin_login.status_code == 200, admin_login.text
+        admin_headers = {"Authorization": f"Bearer {admin_login.json()['token']}"}
+        lab = create_lab(client, student_headers)
+        service_name = f"multi-app-{uuid4().hex[:6]}"
+
+        target_response = client.post(
+            f"/api/labs/{lab['id']}/target-apps",
+            headers=student_headers,
+            json={
+                "appName": "Multi App",
+                "serviceName": service_name,
+                "importType": "local-service",
+                "port": 8080,
+                "healthPath": "/health",
+            },
+        )
+        assert target_response.status_code == 201, target_response.text
+        target = target_response.json()["targetApplication"]
+        validation_response = client.post(
+            f"/api/labs/{lab['id']}/target-apps/{target['id']}/validate",
+            headers=student_headers,
+        )
+        assert validation_response.status_code == 200
+
+        scenario_response = client.post(
+            f"/api/labs/{lab['id']}/custom-scenarios",
+            headers=student_headers,
+            json={
+                "name": "Multi Step Probe",
+                "attackType": "Custom Web App Probe",
+                "riskLevel": "Medium",
+                "steps": [
+                    {
+                        "target": service_name,
+                        "method": "GET",
+                        "endpoint": "/health",
+                        "payloadCategory": "custom_probe",
+                        "expectedSignal": "health_probe",
+                        "count": 2,
+                        "rateLimitPerMinute": 30,
+                    },
+                    {
+                        "target": "auth-service",
+                        "method": "POST",
+                        "endpoint": "/login",
+                        "payloadCategory": "credential_attempt",
+                        "expectedSignal": "credential_probe",
+                        "count": 3,
+                    },
+                ],
+            },
+        )
+        assert scenario_response.status_code == 201, scenario_response.text
+        scenario = scenario_response.json()["scenario"]
+        assert scenario["targetServices"] == [service_name, "auth-service"]
+
+        admin_list = client.get("/api/admin/labs", headers=admin_headers)
+        assert admin_list.status_code == 200, admin_list.text
+        assert any(item["id"] == lab["id"] and item["owner"]["email"] == "demo@pantheon.local" for item in admin_list.json()["labs"])
+
+        cleanup = client.post(f"/api/admin/labs/{lab['id']}/cleanup", headers=admin_headers)
+        assert cleanup.status_code == 200, cleanup.text
+        assert cleanup.json()["lab"]["status"] == "Deleted"
 
 
 def test_custom_scenario_rejects_external_or_unknown_targets() -> None:
